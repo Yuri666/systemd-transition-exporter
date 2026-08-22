@@ -14,10 +14,13 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
+// These MESSAGE_ID values are the systemd journal message identifiers for
+// the actual unit state transitions. They are deliberately different from
+// the "Starting"/"Stopping" progress messages.
 const (
 	messageIDUnitStarted = "39f53479d3a045ac8e11786248231fbf"
-	messageIDUnitStopped = "7b05ebc668384222baa1f8e8f9e1d9b5"
-	messageIDUnitFailed  = "be02cf6855d2428ba40df7e9d022f03d"
+	messageIDUnitStopped = "9d1aaa27d60140bd96365438aad20286"
+	messageIDUnitFailed  = "7d4958e842da4a758f6c1cdc7b36dcc5"
 )
 
 type journalRecord struct {
@@ -29,8 +32,8 @@ type journalRecord struct {
 }
 
 // Recover reads systemd's journal for configured units during a D-Bus gap or
-// exporter downtime. Transition detection uses systemd's stable MESSAGE_ID
-// fields rather than localized human-readable MESSAGE text.
+// exporter downtime. Transition detection uses systemd's MESSAGE_ID fields
+// rather than localized human-readable MESSAGE text.
 func Recover(ctx context.Context, services []string, from, to time.Time) ([]model.Event, error) {
 	if to.Before(from) {
 		return nil, nil
