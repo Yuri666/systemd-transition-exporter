@@ -19,7 +19,17 @@ type Config struct {
 type ServerConfig struct { Listen string `yaml:"listen"` }
 type SystemdConfig struct { ReconnectInterval time.Duration `yaml:"reconnect_interval"`; ReconciliationInterval time.Duration `yaml:"reconciliation_interval"` }
 type WALConfig struct { Enabled bool `yaml:"enabled"`; Directory string `yaml:"directory"`; Fsync bool `yaml:"fsync"` }
-type RemoteWriteConfig struct { Enabled bool `yaml:"enabled"`; URL string `yaml:"url"`; BatchSize int `yaml:"batch_size"`; FlushInterval time.Duration `yaml:"flush_interval"`; RetryInterval time.Duration `yaml:"retry_interval"`; Timeout time.Duration `yaml:"timeout"`; Checkpoint string `yaml:"checkpoint"` }
+type RemoteWriteConfig struct {
+	Enabled bool `yaml:"enabled"`
+	URL string `yaml:"url"`
+	BatchSize int `yaml:"batch_size"`
+	FlushInterval time.Duration `yaml:"flush_interval"`
+	RetryInterval time.Duration `yaml:"retry_interval"`
+	Timeout time.Duration `yaml:"timeout"`
+	Checkpoint string `yaml:"checkpoint"`
+	StateInterval time.Duration `yaml:"state_interval"`
+	Labels map[string]string `yaml:"labels"`
+}
 
 func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path); if err != nil { return Config{}, fmt.Errorf("read config %s: %w", path, err) }
@@ -36,6 +46,18 @@ func Load(path string) (Config, error) {
 		if c.RemoteWrite.RetryInterval <= 0 { c.RemoteWrite.RetryInterval = time.Second }
 		if c.RemoteWrite.Timeout <= 0 { c.RemoteWrite.Timeout = 10 * time.Second }
 		if c.RemoteWrite.Checkpoint == "" { c.RemoteWrite.Checkpoint = "/var/lib/systemd-transition-exporter/remote_write.checkpoint" }
+		if c.RemoteWrite.StateInterval <= 0 { c.RemoteWrite.StateInterval = time.Minute }
+		for name := range c.RemoteWrite.Labels {
+			if !validLabelName(name) || name == "__name__" { return Config{}, fmt.Errorf("invalid remote_write label name %q", name) }
+		}
 	}
 	return c, nil
+}
+
+func validLabelName(s string) bool {
+	for i, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || (i > 0 && r >= '0' && r <= '9') { continue }
+		return false
+	}
+	return len(s) > 0
 }
