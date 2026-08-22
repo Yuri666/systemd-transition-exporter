@@ -27,7 +27,7 @@ Implemented in the current phase:
 - State engine with monotonically increasing event sequence numbers.
 - Detection of a host reboot through `/proc/sys/kernel/random/boot_id`.
 - Host reboot is treated as service downtime for services that were UP before reboot.
-- D-Bus health checking with `org.freedesktop.DBus.Peer.Ping`.
+- D-Bus health checking with `org.freedesktop.DBus.Peer.Ping` on the **systemd manager peer** (`org.freedesktop.systemd1`, `/org/freedesktop/systemd1`).
 - D-Bus reconnect loop.
 - Separate D-Bus connectivity metrics. D-Bus loss does **not** automatically turn a monitored service DOWN.
 - Durable JSONL WAL for detected transition events.
@@ -64,7 +64,7 @@ After reconnect, reconciliation restores the current systemd state. Future work 
                        |
           +------------+-------------+
           |                          |
-    PropertiesChanged          Peer.Ping()
+    PropertiesChanged          systemd Peer.Ping()
           |                          |
           +------------+-------------+
                        |
@@ -148,7 +148,7 @@ go test ./...
 go build ./...
 ```
 
-**Important:** `go build ./...` does not necessarily create a visible executable file when the module contains multiple packages. This is normal Go behavior.
+**Important:** `go build ./...` is a package build check. With multiple packages, it is not the command to rely on for the location/name of the final executable.
 
 ### Build the actual executable
 
@@ -181,6 +181,8 @@ make clean
 ```text
 bin/systemd-transition-exporter
 ```
+
+`make check` runs tests and then builds that executable explicitly.
 
 ## Configuration
 
@@ -226,7 +228,7 @@ Delay between reconnect attempts after an established D-Bus connection is lost. 
 
 ### `systemd.reconciliation_interval`
 
-Reserved for the periodic reconciliation mechanism. The configuration field exists now; the complete periodic reconciliation/recovery implementation will be completed together with journal recovery.
+Reserved for the periodic reconciliation mechanism. The complete periodic reconciliation/recovery implementation will be completed together with journal recovery.
 
 ### `wal.enabled`
 
@@ -309,11 +311,16 @@ The service state is intentionally not changed just because D-Bus is unavailable
 
 ## D-Bus monitoring
 
-The exporter does not infer D-Bus loss from the absence of systemd signals. It actively checks the D-Bus peer with:
+The exporter does not infer D-Bus loss from the absence of systemd signals. It actively checks the **systemd D-Bus manager peer** with:
 
 ```text
-org.freedesktop.DBus.Peer.Ping
+destination: org.freedesktop.systemd1
+object path: /org/freedesktop/systemd1
+interface:  org.freedesktop.DBus.Peer
+method:     Ping
 ```
+
+This is deliberately not a `Peer.Ping` call to the `org.freedesktop.DBus` bus-daemon destination. Some hosts apply D-Bus policy that rejects that call even though the connection is healthy. The health check therefore targets the actual systemd manager object.
 
 The current health-check interval is 1 second and the current ping timeout is 500 ms.
 
@@ -332,7 +339,7 @@ Load configured units
 Install PropertiesChanged match
    |
    v
-Peer.Ping
+systemd Peer.Ping
    |
    v
 CONNECTED
