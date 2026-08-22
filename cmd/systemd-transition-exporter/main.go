@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -22,58 +21,30 @@ import (
 func main() {
 	configPath := flag.String("config", "/etc/systemd-transition-exporter/config.yaml", "configuration file")
 	flag.Parse()
+
 	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatal(err)
-	}
+	if err != nil { log.Fatal(err) }
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	eng := engine.New()
 	reg := metrics.New()
+
 	var eventLog *wal.WAL
 	if cfg.WAL.Enabled {
 		eventLog, err = wal.Open(cfg.WAL.Directory, cfg.WAL.Fsync)
-		if err != nil {
-			log.Fatal(err)
-		}
+		if err != nil { log.Fatal(err) }
 		defer eventLog.Close()
 	}
 
-	var mu sync.Mutex
-	currentBootID, err := systemd.BootID()
-	if err != nil {
-		log.Fatal(err)
-	}
-	bootTime, _ := systemd.BootTime()
-
-	emit := func(e model.Event) error {
-		if eventLog != nil {
-			if err := eventLog.Append(e); err != nil {
-				return err
-			}
-		}
-		reg.Event(e)
-		log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%d", e.Sequence, e.Service, e.State, e.EventTimeUnixMS, e.Source)
-		return nil
-	}
-
 	onSnapshot := func(s model.UnitSnapshot) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if currentBootID != "" && s.BootID != currentBootID {
-			for _, e := range eng.ApplyReboot(s.BootID, bootTime) {
-				if err := emit(e); err != nil {
-					return err
-				}
+		for _, event := range eng.Apply(s) {
+			if eventLog != nil {
+				if err := eventLog.Append(event); err != nil { return err }
 			}
-			currentBootID = s.BootID
-			bootTime, _ = systemd.BootTime()
-		}
-		for _, e := range eng.Apply(s) {
-			if err := emit(e); err != nil {
-				return err
-			}
+			reg.Event(event)
+			log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d", event.Sequence, event.Service, event.State, event.EventTimeUnixMS)
 		}
 		reg.SetState(s.Service, currentState(s.ActiveState))
 		return nil
@@ -86,25 +57,19 @@ func main() {
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: mux}
 	go func() {
 		log.Printf("listening on %s", cfg.Server.Listen)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("HTTP server: %v", err)
-		}
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Printf("HTTP server: %v", err) }
 	}()
 
 	go func() {
 		err := systemd.RunResilient(ctx, cfg.Services, cfg.Systemd.ReconnectInterval, onSnapshot,
 			func(connected bool, at time.Time) {
 				reg.SetDBusConnected(connected, at)
-				if connected {
-					log.Printf("systemd D-Bus connected")
-				} else {
-					log.Printf("systemd D-Bus disconnected")
-				}
+				if connected { log.Printf("systemd D-Bus connected") } else { log.Printf("systemd D-Bus disconnected") }
+			},
+			func(err error) {
+				log.Printf("systemd D-Bus error: %v", err)
 			})
-		if err != nil && err != context.Canceled {
-			log.Printf("systemd monitor stopped: %v", err)
-			stop()
-		}
+		if err != nil && err != context.Canceled { log.Printf("systemd monitor stopped: %v", err); stop() }
 	}()
 
 	<-ctx.Done()
@@ -113,11 +78,7 @@ func main() {
 
 func currentState(active string) model.AvailabilityState {
 	switch active {
-	case "active", "activating":
-		return model.StateUp
-	case "inactive", "failed", "deactivating":
-		return model.StateDown
-	default:
-		return model.StateUnknown
+	case "active": return model.StateUp
+	default: return model.StateDown
 	}
 }
