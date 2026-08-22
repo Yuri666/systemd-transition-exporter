@@ -44,10 +44,8 @@ func main() {
 	}
 
 	walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
-	var durableEvents []model.Event
 	if cfg.WAL.Enabled {
 		if events, e := wal.ReadAll(walPath); e == nil {
-			durableEvents = events
 			for _, event := range events { eng.Replay(event); reg.Event(event) }
 			if len(events) > 0 { log.Printf("replayed %d durable transition events from WAL", len(events)) }
 		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
