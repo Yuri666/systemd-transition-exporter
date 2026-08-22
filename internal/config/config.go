@@ -17,7 +17,11 @@ type Config struct {
 }
 
 type ServerConfig struct { Listen string `yaml:"listen"` }
-type SystemdConfig struct { ReconnectInterval time.Duration `yaml:"reconnect_interval"`; ReconciliationInterval time.Duration `yaml:"reconciliation_interval"` }
+type SystemdConfig struct {
+	ReconnectInterval time.Duration `yaml:"reconnect_interval"`
+	ReconciliationInterval time.Duration `yaml:"reconciliation_interval"`
+	StartupRecoveryInterval time.Duration `yaml:"startup_recovery_interval"`
+}
 type WALConfig struct { Enabled bool `yaml:"enabled"`; Directory string `yaml:"directory"`; Fsync bool `yaml:"fsync"` }
 type RemoteWriteConfig struct {
 	Enabled bool `yaml:"enabled"`
@@ -38,6 +42,7 @@ func Load(path string) (Config, error) {
 	if c.Server.Listen == "" { c.Server.Listen = "127.0.0.1:9877" }
 	if c.Systemd.ReconnectInterval <= 0 { c.Systemd.ReconnectInterval = time.Second }
 	if c.Systemd.ReconciliationInterval <= 0 { c.Systemd.ReconciliationInterval = 30 * time.Second }
+	if c.Systemd.StartupRecoveryInterval <= 0 { c.Systemd.StartupRecoveryInterval = 24 * time.Hour }
 	if len(c.Services) == 0 { return Config{}, fmt.Errorf("services must contain at least one systemd unit") }
 	if c.RemoteWrite.Enabled {
 		if c.RemoteWrite.URL == "" { return Config{}, fmt.Errorf("remote_write.url must be set when remote_write.enabled=true") }
