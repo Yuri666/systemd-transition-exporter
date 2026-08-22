@@ -31,6 +31,7 @@ func RunResilient(ctx context.Context, services []string, reconnectInterval time
 			if onConnectionError != nil { onConnectionError(fmt.Errorf("connect system D-Bus: %w", err)) }
 			continue
 		}
+		SetDebugDBus(d)
 		m := NewMonitor(d)
 		setupFailed := false
 		for _, service := range services {
@@ -41,16 +42,16 @@ func RunResilient(ctx context.Context, services []string, reconnectInterval time
 		if !setupFailed {
 			if err := m.Subscribe(); err != nil { setupFailed = true; if onConnectionError != nil { onConnectionError(fmt.Errorf("subscribe to systemd signals: %w", err)) } }
 		}
-		if setupFailed { _ = d.Close(); continue }
+		if setupFailed { _ = d.Close(); SetDebugDBus(nil); continue }
 		bootID, err := BootID()
-		if err != nil { _ = d.Close(); return fmt.Errorf("read boot id: %w", err) }
+		if err != nil { _ = d.Close(); SetDebugDBus(nil); return fmt.Errorf("read boot id: %w", err) }
 		for _, service := range services {
 			u := m.byService(service); if u == nil { continue }
 			s, e := u.Snapshot(bootID)
 			if e != nil { setupFailed = true; if onConnectionError != nil { onConnectionError(fmt.Errorf("initial snapshot %s: %w", service, e)) }; break }
-			if e = onSnapshot(s); e != nil { _ = d.Close(); return e }
+			if e = onSnapshot(s); e != nil { _ = d.Close(); SetDebugDBus(nil); return e }
 		}
-		if setupFailed { _ = d.Close(); continue }
+		if setupFailed { _ = d.Close(); SetDebugDBus(nil); continue }
 		if !disconnectedAt.IsZero() && onRecovery != nil {
 			until := time.Now()
 			if err := onRecovery(disconnectedAt, until); err != nil && onConnectionError != nil { onConnectionError(fmt.Errorf("journal recovery: %w", err)) }
@@ -62,6 +63,7 @@ func RunResilient(ctx context.Context, services []string, reconnectInterval time
 			s, e := u.Snapshot(bootID); if e != nil { return e }
 			return onSnapshot(s)
 		})
+		SetDebugDBus(nil)
 		_ = d.Close()
 		if ctx.Err() != nil { return ctx.Err() }
 		disconnectedAt = time.Now()
