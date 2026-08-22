@@ -62,8 +62,8 @@ func Recover(ctx context.Context, services []string, from, to time.Time) ([]mode
 func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]model.Event, error) {
 	args := []string{
 		"-u", service,
-		"--since", from.Format(time.RFC3339Nano),
-		"--until", to.Format(time.RFC3339Nano),
+		"--since", journalctlTimestamp(from),
+		"--until", journalctlTimestamp(to),
 		"-o", "json",
 		"--no-pager",
 		"--quiet",
@@ -136,6 +136,15 @@ func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]mod
 		return nil, fmt.Errorf("journalctl %s: %w", service, err)
 	}
 	return out, nil
+}
+
+// journalctlTimestamp deliberately uses journalctl's portable local-time
+// syntax instead of RFC3339 with an explicit offset. Some systemd/journalctl
+// versions reject values such as "2026-08-22T20:14:39.677+03:00" even though
+// they are valid RFC3339 timestamps. The journal record's own
+// __REALTIME_TIMESTAMP remains the authoritative event timestamp.
+func journalctlTimestamp(t time.Time) string {
+	return t.Local().Format("2006-01-02 15:04:05")
 }
 
 func isNoJournalEntriesError(err error) bool {
