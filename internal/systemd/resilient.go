@@ -1,76 +1,148 @@
 package systemd
 
 import (
-    "context"
-    "time"
+	"context"
+	"fmt"
+	"time"
 
-    "github.com/Yuri666/systemd-transition-exporter/internal/model"
+	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
-// RunResilient owns the D-Bus connection lifecycle. A failed Peer.Ping is
-// treated as transport loss; a fresh connection is established, subscriptions
-// are recreated, and all configured units are reconciled before live signals.
-func RunResilient(ctx context.Context, services []string, reconnectInterval time.Duration, onSnapshot func(model.UnitSnapshot) error, onConnectionState func(bool, time.Time)) error {
-    if reconnectInterval <= 0 { reconnectInterval = time.Second }
-    first := true
-    for {
-        if !first {
-            timer := time.NewTimer(reconnectInterval)
-            select { case <-ctx.Done(): timer.Stop(); return ctx.Err(); case <-timer.C: }
-        }
-        first = false
+// RunResilient owns the D-Bus connection lifecycle.
+//
+// A connection is considered CONNECTED only after the bus connection has been
+// established, all configured units have been loaded, subscriptions installed,
+// and a Peer.Ping succeeds. Failures during initial setup are reported as
+// connection errors but do not increment the disconnect counter in the caller.
+// Once CONNECTED, only a failed health check or a monitor transport error causes
+// CONNECTED -> DISCONNECTED and a reconnect cycle.
+func RunResilient(
+	ctx context.Context,
+	services []string,
+	reconnectInterval time.Duration,
+	onSnapshot func(model.UnitSnapshot) error,
+	onConnectionState func(bool, time.Time),
+	onConnectionError func(error),
+) error {
+	if reconnectInterval <= 0 {
+		reconnectInterval = time.Second
+	}
 
-        d, err := Connect(ctx)
-        if err != nil {
-            if ctx.Err() != nil { return ctx.Err() }
-            if onConnectionState != nil { onConnectionState(false, time.Now()) }
-            continue
-        }
+	connectedOnce := false
 
-        m := NewMonitor(d)
-        failed := false
-        for _, service := range services {
-            u, e := d.LoadUnit(service)
-            if e != nil { failed = true; break }
-            m.AddUnit(u)
-        }
-        if failed || m.Subscribe() != nil {
-            _ = d.Close()
-            if onConnectionState != nil { onConnectionState(false, time.Now()) }
-            continue
-        }
-        if err := m.Ping(ctx); err != nil {
-            _ = d.Close()
-            if onConnectionState != nil { onConnectionState(false, time.Now()) }
-            continue
-        }
+	for {
+		if connectedOnce {
+			timer := time.NewTimer(reconnectInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 
-        bootID, err := BootID()
-        if err != nil { _ = d.Close(); return err }
-        for _, service := range services {
-            u := m.byService(service)
-            if u == nil { continue }
-            s, e := u.Snapshot(bootID)
-            if e != nil { failed = true; break }
-            if e = onSnapshot(s); e != nil { _ = d.Close(); return e }
-        }
-        if failed {
-            _ = d.Close()
-            if onConnectionState != nil { onConnectionState(false, time.Now()) }
-            continue
-        }
+		d, err := Connect(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if onConnectionError != nil {
+				onConnectionError(fmt.Errorf("connect system D-Bus: %w", err))
+			}
+			continue
+		}
 
-        if onConnectionState != nil { onConnectionState(true, time.Now()) }
-        // Monitor.Run consumes D-Bus signals and performs transport health checks.
-        // Its callback accepts *Unit, so adapt it to the public snapshot callback.
-        runErr := m.Run(ctx, func(u *Unit) error {
-            s, e := u.Snapshot(bootID)
-            if e != nil { return e }
-            return onSnapshot(s)
-        })
-        _ = d.Close()
-        if ctx.Err() != nil { return ctx.Err() }
-        if onConnectionState != nil { onConnectionState(false, time.Now()) }
-        if runErr != nil { continue }
-    }
+		m := NewMonitor(d)
+		setupFailed := false
+
+		for _, service := range services {
+			u, e := d.LoadUnit(service)
+			if e != nil {
+				setupFailed = true
+				if onConnectionError != nil {
+					onConnectionError(fmt.Errorf("load systemd unit %s: %w", service, e))
+				}
+				break
+			}
+			m.AddUnit(u)
+		}
+
+		if !setupFailed {
+			if err := m.Subscribe(); err != nil {
+				setupFailed = true
+				if onConnectionError != nil {
+					onConnectionError(fmt.Errorf("subscribe to systemd signals: %w", err))
+				}
+			}
+		}
+
+		if !setupFailed {
+			if err := m.Ping(ctx); err != nil {
+				setupFailed = true
+				if onConnectionError != nil {
+					onConnectionError(fmt.Errorf("system D-Bus health check: %w", err))
+				}
+			}
+		}
+
+		if setupFailed {
+			_ = d.Close()
+			continue
+		}
+
+		bootID, err := BootID()
+		if err != nil {
+			_ = d.Close()
+			return fmt.Errorf("read boot id: %w", err)
+		}
+
+		for _, service := range services {
+			u := m.byService(service)
+			if u == nil {
+				continue
+			}
+			s, e := u.Snapshot(bootID)
+			if e != nil {
+				setupFailed = true
+				if onConnectionError != nil {
+					onConnectionError(fmt.Errorf("initial snapshot %s: %w", service, e))
+				}
+				break
+			}
+			if e = onSnapshot(s); e != nil {
+				_ = d.Close()
+				return e
+			}
+		}
+
+		if setupFailed {
+			_ = d.Close()
+			continue
+		}
+
+		if onConnectionState != nil {
+			onConnectionState(true, time.Now())
+		}
+		connectedOnce = true
+
+		runErr := m.Run(ctx, func(u *Unit) error {
+			s, e := u.Snapshot(bootID)
+			if e != nil {
+				return e
+			}
+			return onSnapshot(s)
+		})
+
+		_ = d.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if onConnectionState != nil {
+			onConnectionState(false, time.Now())
+		}
+		if onConnectionError != nil && runErr != nil {
+			onConnectionError(fmt.Errorf("systemd D-Bus monitoring lost: %w", runErr))
+		}
+	}
 }
