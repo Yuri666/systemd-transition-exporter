@@ -50,7 +50,7 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	}
 
 	type candidate struct {
-		state model.AvailabilityState
+		state  model.AvailabilityState
 		unixUS uint64
 		monoUS uint64
 	}
@@ -82,20 +82,24 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 		events = append(events, event)
 	}
 
-	e.states[s.Service] = model.ServiceState{
+	updated := model.ServiceState{
 		Service: s.Service, Availability: newState,
 		ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID,
 		LastActiveEnterTimestampUS: s.ActiveEnterTimestampUS,
 		LastActiveExitTimestampUS: s.ActiveExitTimestampUS,
 		LastActiveEnterMonotonicUS: s.ActiveEnterTimestampMonotonicUS,
 		LastActiveExitMonotonicUS: s.ActiveExitTimestampMonotonicUS,
+		LastEventTimeUnixMS: old.LastEventTimeUnixMS,
+		LastEventMonoUS: old.LastEventMonoUS,
+		LastSequence: old.LastSequence,
 	}
 	if len(events) > 0 {
 		last := events[len(events)-1]
-		e.states[s.Service].LastEventTimeUnixMS = last.EventTimeUnixMS
-		e.states[s.Service].LastEventMonoUS = last.EventTimeMonotonicUS
-		e.states[s.Service].LastSequence = last.Sequence
+		updated.LastEventTimeUnixMS = last.EventTimeUnixMS
+		updated.LastEventMonoUS = last.EventTimeMonotonicUS
+		updated.LastSequence = last.Sequence
 	}
+	e.states[s.Service] = updated
 	return events
 }
 
