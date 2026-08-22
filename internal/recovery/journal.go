@@ -24,11 +24,12 @@ const (
 )
 
 type journalRecord struct {
-	Message   string `json:"MESSAGE"`
-	MessageID string `json:"MESSAGE_ID"`
-	Unit      string `json:"_SYSTEMD_UNIT"`
-	BootID    string `json:"_BOOT_ID"`
-	RTUS      string `json:"__REALTIME_TIMESTAMP"`
+	Message     string `json:"MESSAGE"`
+	MessageID   string `json:"MESSAGE_ID"`
+	SystemdUnit string `json:"_SYSTEMD_UNIT"`
+	Unit        string `json:"UNIT"`
+	BootID      string `json:"_BOOT_ID"`
+	RTUS        string `json:"__REALTIME_TIMESTAMP"`
 }
 
 // Recover reads systemd's journal for configured units during a D-Bus gap or
@@ -92,9 +93,16 @@ func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]mod
 		if !ok {
 			continue
 		}
+
+		// journalctl -u service is already the authoritative journal filter.
+		// For lifecycle records, UNIT contains the affected unit while
+		// _SYSTEMD_UNIT may contain the emitting manager scope (e.g. init.scope).
+		// Do not filter on _SYSTEMD_UNIT. If UNIT is present, use it to reject
+		// records that demonstrably belong to another unit.
 		if r.Unit != "" && r.Unit != service {
 			continue
 		}
+
 		us := parseTimestampUS(r.RTUS)
 		if us == 0 {
 			continue
