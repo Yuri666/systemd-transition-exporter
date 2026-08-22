@@ -53,19 +53,12 @@ func main() {
 		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
 	}
 
-	// Recover the period in which the exporter itself was stopped. If a WAL is
-	// available, start at its oldest durable event. This deliberately overlaps
-	// the WAL history: Engine.ApplyRecovery drops events already restored from
-	// the WAL, while accepting newer journal events. Using time.Now() as the
-	// lower boundary loses transitions that happened just before startup.
 	startupFrom := time.Now().Add(-cfg.Systemd.StartupRecoveryInterval)
 	if len(durableEvents) > 0 {
 		oldest := durableEvents[0].EventTimeUnixMS
 		for _, event := range durableEvents[1:] {
 			if event.EventTimeUnixMS < oldest { oldest = event.EventTimeUnixMS }
 		}
-		// journalctl is queried at second precision. Include one extra second
-		// before the oldest durable event to avoid a boundary loss.
 		startupFrom = time.UnixMilli(oldest).Add(-time.Second)
 	}
 	startupTo := time.Now()
@@ -93,6 +86,23 @@ func main() {
 		Labels: cfg.RemoteWrite.Labels,
 	})
 	if err != nil { log.Fatal(err) }
+
+	if rw != nil {
+		reg.SetRemoteWriteStats(rw.Stats())
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					reg.SetRemoteWriteStats(rw.Stats())
+				case <-ctx.Done():
+					reg.SetRemoteWriteStats(rw.Stats())
+					return
+				}
+			}
+		}()
+	}
 
 	eventQueue := make(chan model.Event, 100000)
 	stateQueue := make(chan model.ServiceState, 10000)

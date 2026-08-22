@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
+	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
 )
 
 type Registry struct {
@@ -20,6 +21,8 @@ type Registry struct {
 	dbusDisconnects    uint64
 	dbusLastChangeMS   int64
 	dbusDisconnectedAt time.Time
+
+	remoteWrite remote_write.Stats
 }
 
 func New() *Registry {
@@ -82,6 +85,15 @@ func (r *Registry) SetDBusConnected(connected bool, at time.Time) {
 	}
 }
 
+// SetRemoteWriteStats publishes a snapshot of the Remote Write delivery
+// counters. It is intentionally a snapshot: the sender remains independent
+// from the Prometheus exposition path.
+func (r *Registry) SetRemoteWriteStats(stats remote_write.Stats) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.remoteWrite = stats
+}
+
 func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -111,4 +123,9 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 		disconnectedSeconds = time.Since(r.dbusDisconnectedAt).Seconds()
 	}
 	fmt.Fprintf(w, "systemd_transition_exporter_dbus_disconnected_seconds %g\n", disconnectedSeconds)
+
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_successful_requests_total %d\n", r.remoteWrite.SuccessfulRequests)
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_failed_requests_total %d\n", r.remoteWrite.FailedRequests)
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_retries_total %d\n", r.remoteWrite.Retries)
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_samples_sent_total %d\n", r.remoteWrite.SentSamples)
 }
