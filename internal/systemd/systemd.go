@@ -34,8 +34,11 @@ func(m *Monitor)AddUnit(u *Unit){m.byPath[u.Path()]=u}
 func(m *Monitor)byService(s string)*Unit{for _,u:=range m.byPath{if u!=nil&&u.Service()==s{return u}};return nil}
 func(m *Monitor)Subscribe()error{args:="type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path_namespace='/org/freedesktop/systemd1/unit'";if e:=m.dbus.conn.Object(dbusIF,dbusPath).Call(dbusIF+".AddMatch",0,args).Err;e!=nil{return fmt.Errorf("AddMatch: %w",e)};return nil}
 
-// godbus/dbus/v5 has no Conn.Done channel. A real D-Bus Peer.Ping is therefore
-// used to detect a broken transport independently of application signals.
-func(m *Monitor)Ping(ctx context.Context)error{return m.dbus.conn.Object(dbusIF,dbusPath).CallWithContext(ctx,"org.freedesktop.DBus.Peer.Ping",0).Err}
+// godbus/dbus/v5 has no Conn.Done channel. Do not ping the bus daemon itself:
+// local D-Bus policy may reject org.freedesktop.DBus.Peer.Ping for clients even
+// when the connection is healthy. Ping the systemd manager peer instead. This
+// exercises the same D-Bus transport and also verifies that the systemd D-Bus
+// service is reachable without calling a mutating Manager method.
+func(m *Monitor)Ping(ctx context.Context)error{return m.dbus.conn.Object(busName,managerPath).CallWithContext(ctx,"org.freedesktop.DBus.Peer.Ping",0).Err}
 func(m *Monitor)Run(ctx context.Context,handler func(*Unit)error)error{signals:=make(chan *dbus.Signal,256);m.dbus.conn.Signal(signals);defer m.dbus.conn.RemoveSignal(signals);ticker:=time.NewTicker(time.Second);defer ticker.Stop();for{select{case<-ctx.Done():return ctx.Err();case<-ticker.C:pctx,cancel:=context.WithTimeout(ctx,500*time.Millisecond);e:=m.Ping(pctx);cancel();if e!=nil{return fmt.Errorf("D-Bus ping failed: %w",e)};case sig:=<-signals:if sig==nil{return fmt.Errorf("D-Bus signal channel closed")};if sig.Name!=propertiesIF+".PropertiesChanged"||len(sig.Body)<2{continue};u,ok:=m.byPath[sig.Path];if !ok{continue};iface,ok:=sig.Body[0].(string);if !ok||iface!=unitIface{continue};props,ok:=sig.Body[1].(map[string]dbus.Variant);if !ok||!interesting(props){continue};if e:=handler(u);e!=nil{return e}}}}
 func interesting(p map[string]dbus.Variant)bool{for n:=range p{switch n{case "ActiveState","SubState","ActiveEnterTimestamp","ActiveExitTimestamp","ActiveEnterTimestampMonotonic","ActiveExitTimestampMonotonic":return true}};return false}
