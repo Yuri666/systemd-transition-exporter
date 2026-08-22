@@ -1,0 +1,16 @@
+server:
+  listen: "0.0.0.0:9877"
+
+services:
+  - pcscf.service
+  - scscf.service
+  - icscf.service
+
+systemd:
+  reconnect_interval: 1s
+  reconciliation_interval: 30s
+
+wal:
+  enabled: true
+  directory: /var/lib/systemd-transition-exporter/wal
+  fsync: true
