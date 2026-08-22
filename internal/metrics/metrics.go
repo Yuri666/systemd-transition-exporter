@@ -16,30 +16,44 @@ type Registry struct {
 	down   map[string]uint64
 	last   map[string]int64
 
-	dbusConnected       bool
-	dbusDisconnects     uint64
-	dbusLastChangeMS    int64
-	dbusDisconnectedAt  time.Time
+	dbusConnected      bool
+	dbusDisconnects    uint64
+	dbusLastChangeMS   int64
+	dbusDisconnectedAt time.Time
 }
 
 func New() *Registry {
 	return &Registry{
-		states: map[string]model.AvailabilityState{},
-		up:     map[string]uint64{},
-		down:   map[string]uint64{},
-		dbusConnected: false,
+		states: make(map[string]model.AvailabilityState),
+		up:     make(map[string]uint64),
+		down:   make(map[string]uint64),
 	}
 }
 
 func (r *Registry) SetState(service string, state model.AvailabilityState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.states == nil {
+		r.states = make(map[string]model.AvailabilityState)
+	}
 	r.states[service] = state
 }
 
 func (r *Registry) Event(e model.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.states == nil {
+		r.states = make(map[string]model.AvailabilityState)
+	}
+	if r.up == nil {
+		r.up = make(map[string]uint64)
+	}
+	if r.down == nil {
+		r.down = make(map[string]uint64)
+	}
+	if r.last == nil {
+		r.last = make(map[string]int64)
+	}
 	r.states[e.Service] = e.State
 	r.last[e.Service] = e.EventTimeUnixMS
 	if e.State == model.StateUp {
@@ -51,10 +65,7 @@ func (r *Registry) Event(e model.Event) {
 }
 
 // SetDBusConnected records collector connectivity to the system D-Bus.
-// D-Bus loss is deliberately independent from service availability: a lost
-// connection does not turn monitored services DOWN. It is exposed separately
-// so Prometheus can distinguish "service is down" from "collector cannot see
-// systemd".
+// D-Bus loss is deliberately independent from service availability.
 func (r *Registry) SetDBusConnected(connected bool, at time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
