@@ -29,10 +29,8 @@ func (d *DBus) Conn()*dbus.Conn{return d.conn}
 
 func BootID()(string,error){b,err:=os.ReadFile("/proc/sys/kernel/random/boot_id");if err!=nil{return "",fmt.Errorf("read boot_id: %w",err)};return strings.TrimSpace(string(b)),nil}
 
-// BootTime returns the host boot time using CLOCK_BOOTTIME's /proc uptime
-// together with wall-clock time. It is used to timestamp reboot downtime.
 func BootTime()(time.Time,error){
-b,err:=os.ReadFile("/proc/uptime");if err!=nil{return time.Time{},fmt.Errorf("read uptime: %w",err)}
+	b,err:=os.ReadFile("/proc/uptime");if err!=nil{return time.Time{},fmt.Errorf("read uptime: %w",err)}
 	fields:=strings.Fields(string(b));if len(fields)==0{return time.Time{},fmt.Errorf("invalid /proc/uptime")}
 	sec,err:=strconv.ParseFloat(fields[0],64);if err!=nil{return time.Time{},fmt.Errorf("parse uptime: %w",err)}
 	return time.Now().Add(-time.Duration(sec*float64(time.Second))),nil
@@ -51,5 +49,5 @@ type Monitor struct{dbus *DBus;byPath map[dbus.ObjectPath]*Unit}
 func NewMonitor(d *DBus)*Monitor{return &Monitor{dbus:d,byPath:make(map[dbus.ObjectPath]*Unit)}}
 func(m *Monitor)AddUnit(u *Unit){m.byPath[u.Path()]=u}
 func(m *Monitor)Subscribe()error{args:="type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path_namespace='/org/freedesktop/systemd1/unit'";if err:=m.dbus.conn.Object(dbusIF,dbusPath).Call(dbusIF+".AddMatch",0,args).Err;err!=nil{return fmt.Errorf("AddMatch: %w",err)};return nil}
-func(m *Monitor)Run(ctx context.Context,handler func(*Unit)error)error{signals:=make(chan *dbus.Signal,256);m.dbus.conn.Signal(signals);defer m.dbus.conn.RemoveSignal(signals);for{select{case<-ctx.Done():return ctx.Err();case sig:=<-signals:if sig==nil{return fmt.Errorf("D-Bus signal channel closed")};if sig.Name!=propertiesIF+".PropertiesChanged"||len(sig.Body)<2{continue};u,ok:=m.byPath[sig.Path];if !ok{continue};iface,ok:=sig.Body[0].(string);if !ok||iface!=unitIface{continue};props,ok:=sig.Body[1].(map[string]dbus.Variant);if !ok||!interesting(props){continue};if err:=handler(u);err!=nil{return err}}}}
+func(m *Monitor)Run(ctx context.Context,handler func(*Unit)error)error{signals:=make(chan *dbus.Signal,256);m.dbus.conn.Signal(signals);defer m.dbus.conn.RemoveSignal(signals);for{select{case<-ctx.Done():return ctx.Err();case<-m.dbus.conn.Done():return fmt.Errorf("D-Bus connection closed");case sig:=<-signals:if sig==nil{return fmt.Errorf("D-Bus signal channel closed")};if sig.Name!=propertiesIF+".PropertiesChanged"||len(sig.Body)<2{continue};u,ok:=m.byPath[sig.Path];if !ok{continue};iface,ok:=sig.Body[0].(string);if !ok||iface!=unitIface{continue};props,ok:=sig.Body[1].(map[string]dbus.Variant);if !ok||!interesting(props){continue};if err:=handler(u);err!=nil{return err}}}}
 func interesting(props map[string]dbus.Variant)bool{for name:=range props{switch name{case "ActiveState","SubState","ActiveEnterTimestamp","ActiveExitTimestamp","ActiveEnterTimestampMonotonic","ActiveExitTimestampMonotonic":return true}};return false}
