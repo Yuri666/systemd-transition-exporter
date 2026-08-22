@@ -10,6 +10,10 @@ systemd:
   reconnect_interval: 1s
   reconciliation_interval: 30s
 
+  # If the WAL contains history, startup recovery begins at the oldest
+  # durable event. If the WAL is empty, recover this much journal history.
+  startup_recovery_interval: 24h
+
 wal:
   enabled: true
   directory: /var/lib/systemd-transition-exporter/wal
