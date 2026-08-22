@@ -10,7 +10,6 @@ import (
 
 type Engine struct {
 	mu sync.Mutex
-
 	states map[string]model.ServiceState
 	seq    uint64
 }
@@ -23,12 +22,8 @@ func (e *Engine) State(service string) (model.ServiceState, bool) {
 	return s, ok
 }
 
-// Replay restores the durable event stream after a collector restart. Replay
-// never creates a new event and advances the in-memory sequence to the highest
-// sequence already committed to the WAL.
 func (e *Engine) Replay(event model.Event) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.Lock(); defer e.mu.Unlock()
 	if event.Sequence > e.seq { e.seq = event.Sequence }
 	state := e.states[event.Service]
 	if state.Service == "" { state.Service = event.Service }
@@ -41,10 +36,11 @@ func (e *Engine) Replay(event model.Event) {
 	e.states[event.Service] = state
 }
 
-// Apply consumes a systemd snapshot. The first snapshot initializes state and
-// does not emit a transition. Later snapshots detect every newly observed
-// ActiveEnter/ActiveExit timestamp, even when several transitions occurred
-// between two observations.
+// Apply consumes a systemd snapshot. A candidate is emitted only when it is
+// newer than both the corresponding systemd timestamp already observed and
+// the last event timestamp restored/recovered by the engine. The second
+// condition prevents journal-recovered events from being emitted again by the
+// first D-Bus snapshot after startup/reconnect.
 func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	e.mu.Lock(); defer e.mu.Unlock()
 	newState := availability(s.ActiveState)
@@ -55,8 +51,12 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	}
 	type candidate struct { state model.AvailabilityState; unixUS, monoUS uint64 }
 	var candidates []candidate
-	if s.ActiveExitTimestampUS > old.LastActiveExitTimestampUS { candidates = append(candidates, candidate{model.StateDown, s.ActiveExitTimestampUS, s.ActiveExitTimestampMonotonicUS}) }
-	if s.ActiveEnterTimestampUS > old.LastActiveEnterTimestampUS { candidates = append(candidates, candidate{model.StateUp, s.ActiveEnterTimestampUS, s.ActiveEnterTimestampMonotonicUS}) }
+	if s.ActiveExitTimestampUS > old.LastActiveExitTimestampUS && int64(s.ActiveExitTimestampUS/1000) > old.LastEventTimeUnixMS {
+		candidates = append(candidates, candidate{model.StateDown, s.ActiveExitTimestampUS, s.ActiveExitTimestampMonotonicUS})
+	}
+	if s.ActiveEnterTimestampUS > old.LastActiveEnterTimestampUS && int64(s.ActiveEnterTimestampUS/1000) > old.LastEventTimeUnixMS {
+		candidates = append(candidates, candidate{model.StateUp, s.ActiveEnterTimestampUS, s.ActiveEnterTimestampMonotonicUS})
+	}
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].unixUS < candidates[j].unixUS })
 	events := make([]model.Event, 0, len(candidates))
 	for _, c := range candidates {
@@ -69,9 +69,6 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	return events
 }
 
-// ApplyRecovery imports a journal transition. Duplicate or older records are
-// ignored, making overlap between realtime D-Bus events and journal recovery
-// safe. New records receive normal collector sequence numbers.
 func (e *Engine) ApplyRecovery(event model.Event) []model.Event {
 	e.mu.Lock(); defer e.mu.Unlock()
 	state := e.states[event.Service]
@@ -104,8 +101,6 @@ func (e *Engine) ApplyReboot(bootID string, eventTime time.Time) []model.Event {
 
 func (e *Engine) Sequence() uint64 { e.mu.Lock(); defer e.mu.Unlock(); return e.seq }
 
-// availability deliberately uses a strict mapping: only systemd ActiveState
-// "active" is considered UP. Every other ActiveState is DOWN.
 func availability(activeState string) model.AvailabilityState {
 	if activeState == "active" { return model.StateUp }
 	return model.StateDown
