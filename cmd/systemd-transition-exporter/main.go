@@ -54,17 +54,15 @@ func main() {
 	}
 
 	// Recover transitions that happened while the exporter itself was stopped.
-	// If the WAL has history, use its oldest event as the safe lower boundary so
-	// every configured service is covered. With no history, use the configurable
-	// startup recovery window.
+	// Always use the configured startup recovery window. Using the oldest WAL
+	// event as the lower boundary is incorrect: the engine has already replayed
+	// the WAL and therefore treats those historical events as known. The startup
+	// window deliberately overlaps the WAL history; Engine.ApplyRecovery filters
+	// duplicates by timestamp while importing events that happened after the
+	// last durable event for each service.
 	startupFrom := time.Now().Add(-cfg.Systemd.StartupRecoveryInterval)
-	if len(durableEvents) > 0 {
-		startupFrom = time.UnixMilli(durableEvents[0].EventTimeUnixMS)
-		for _, event := range durableEvents[1:] {
-			if t := time.UnixMilli(event.EventTimeUnixMS); t.Before(startupFrom) { startupFrom = t }
-		}
-	}
 	startupTo := time.Now()
+	log.Printf("starting journal recovery window from=%s to=%s", startupFrom.Format(time.RFC3339Nano), startupTo.Format(time.RFC3339Nano))
 	if events, e := recovery.Recover(ctx, cfg.Services, startupFrom, startupTo); e != nil {
 		log.Printf("startup journal recovery failed: %v", e)
 	} else {
@@ -77,7 +75,7 @@ func main() {
 				log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 			}
 		}
-		if len(events) > 0 || imported > 0 { log.Printf("startup journal recovery completed: candidates=%d imported=%d", len(events), imported) }
+		log.Printf("startup journal recovery completed: candidates=%d imported=%d", len(events), imported)
 	}
 
 	rw, err := remote_write.New(remote_write.Config{
