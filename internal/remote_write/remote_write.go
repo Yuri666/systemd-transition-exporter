@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,23 +18,8 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
-type Config struct {
-	Enabled       bool
-	URL           string
-	BatchSize     int
-	FlushInterval time.Duration
-	RetryInterval time.Duration
-	Timeout       time.Duration
-	Checkpoint    string
-}
-
-type Sender struct {
-	cfg Config
-	client *http.Client
-	mu sync.Mutex
-	lastSent uint64
-}
-
+type Config struct { Enabled bool; URL string; BatchSize int; FlushInterval time.Duration; RetryInterval time.Duration; Timeout time.Duration; Checkpoint string }
+type Sender struct { cfg Config; client *http.Client; mu sync.Mutex; lastSent uint64 }
 type checkpoint struct { LastSequence uint64 `json:"last_sequence"` }
 
 func New(cfg Config) (*Sender, error) {
@@ -51,16 +37,19 @@ func New(cfg Config) (*Sender, error) {
 
 func (s *Sender) LastSent() uint64 { s.mu.Lock(); defer s.mu.Unlock(); return s.lastSent }
 
-// Send transmits events in sequence order. A checkpoint is committed only
-// after Prometheus acknowledges the complete batch. A crash between send and
-// checkpoint can therefore produce an exact duplicate, which is preferable to
-// losing a transition.
+// Send transmits only events newer than the durable checkpoint. Events are
+// sorted by collector sequence before transmission. The checkpoint is advanced
+// only after Prometheus acknowledges the complete batch.
 func (s *Sender) Send(ctx context.Context, events []model.Event) error {
 	if s == nil || len(events) == 0 { return nil }
-	for start := 0; start < len(events); {
-		end := start + s.cfg.BatchSize
-		if end > len(events) { end = len(events) }
-		batch := events[start:end]
+	s.mu.Lock(); last := s.lastSent; s.mu.Unlock()
+	pending := make([]model.Event, 0, len(events))
+	for _, e := range events { if e.Sequence > last { pending = append(pending, e) } }
+	if len(pending) == 0 { return nil }
+	sort.SliceStable(pending, func(i,j int) bool { return pending[i].Sequence < pending[j].Sequence })
+	for start := 0; start < len(pending); {
+		end := start + s.cfg.BatchSize; if end > len(pending) { end = len(pending) }
+		batch := pending[start:end]
 		if err := s.sendBatch(ctx, batch); err != nil { return err }
 		if err := s.saveCheckpoint(batch[len(batch)-1].Sequence); err != nil { return err }
 		start = end
@@ -72,61 +61,31 @@ func (s *Sender) sendBatch(ctx context.Context, events []model.Event) error {
 	series := make(map[string]*prompb.TimeSeries)
 	for _, e := range events {
 		ts := series[e.Service]
-		if ts == nil {
-			ts = &prompb.TimeSeries{Labels: []prompb.Label{{Name: "__name__", Value: "systemd_service_state"}, {Name: "service", Value: e.Service}}}
-			series[e.Service] = ts
-		}
-		value := float64(0)
-		if e.State == model.StateUp { value = 1 }
-		ts.Samples = append(ts.Samples, prompb.Sample{Value: value, Timestamp: e.EventTimeUnixMS})
+		if ts == nil { ts = &prompb.TimeSeries{Labels: []prompb.Label{{Name:"__name__",Value:"systemd_service_state"},{Name:"service",Value:e.Service}}}; series[e.Service] = ts }
+		value := float64(0); if e.State == model.StateUp { value = 1 }
+		ts.Samples = append(ts.Samples, prompb.Sample{Value:value, Timestamp:e.EventTimeUnixMS})
 	}
-
 	request := &prompb.WriteRequest{}
 	for _, ts := range series { request.Timeseries = append(request.Timeseries, *ts) }
-	payload, err := request.Marshal()
-	if err != nil { return fmt.Errorf("marshal remote_write request: %w", err) }
+	payload, err := request.Marshal(); if err != nil { return fmt.Errorf("marshal remote_write request: %w", err) }
 	payload = snappy.Encode(nil, payload)
-
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.URL, bytes.NewReader(payload))
-		if err != nil { return err }
-		req.Header.Set("Content-Type", "application/x-protobuf")
-		req.Header.Set("Content-Encoding", "snappy")
-		req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+		req, err := http.NewRequestWithContext(ctx,http.MethodPost,s.cfg.URL,bytes.NewReader(payload)); if err != nil { return err }
+		req.Header.Set("Content-Type","application/x-protobuf"); req.Header.Set("Content-Encoding","snappy"); req.Header.Set("X-Prometheus-Remote-Write-Version","0.1.0")
 		resp, err := s.client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 { return nil }
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 { return fmt.Errorf("remote_write rejected request: HTTP %d", resp.StatusCode) }
-		}
-		timer := time.NewTimer(s.cfg.RetryInterval)
-		select {
-		case <-ctx.Done(): timer.Stop(); return ctx.Err()
-		case <-timer.C:
-		}
+		if err == nil { io.Copy(io.Discard,resp.Body); resp.Body.Close(); if resp.StatusCode >= 200 && resp.StatusCode < 300 { return nil }; if resp.StatusCode >= 400 && resp.StatusCode < 500 { return fmt.Errorf("remote_write rejected request: HTTP %d",resp.StatusCode) } }
+		t := time.NewTimer(s.cfg.RetryInterval); select { case <-ctx.Done(): t.Stop(); return ctx.Err(); case <-t.C: }
 	}
 }
 
 func (s *Sender) loadCheckpoint() error {
-	data, err := os.ReadFile(s.cfg.Checkpoint)
-	if os.IsNotExist(err) { return nil }
-	if err != nil { return fmt.Errorf("read remote_write checkpoint: %w", err) }
-	var c checkpoint
-	if err := json.Unmarshal(data, &c); err != nil { return fmt.Errorf("decode remote_write checkpoint: %w", err) }
-	s.lastSent = c.LastSequence
-	return nil
+	data, err := os.ReadFile(s.cfg.Checkpoint); if os.IsNotExist(err) { return nil }; if err != nil { return fmt.Errorf("read remote_write checkpoint: %w",err) }
+	var c checkpoint; if err := json.Unmarshal(data,&c); err != nil { return fmt.Errorf("decode remote_write checkpoint: %w",err) }; s.lastSent = c.LastSequence; return nil
 }
 
 func (s *Sender) saveCheckpoint(seq uint64) error {
-	s.mu.Lock(); defer s.mu.Unlock()
-	if seq <= s.lastSent { return nil }
-	data, err := json.Marshal(checkpoint{LastSequence: seq})
-	if err != nil { return err }
-	if err := os.MkdirAll(filepath.Dir(s.cfg.Checkpoint), 0750); err != nil { return err }
-	tmp := s.cfg.Checkpoint + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0640); err != nil { return err }
-	if err := os.Rename(tmp, s.cfg.Checkpoint); err != nil { return err }
-	s.lastSent = seq
-	return nil
+	s.mu.Lock(); defer s.mu.Unlock(); if seq <= s.lastSent { return nil }
+	data, err := json.Marshal(checkpoint{LastSequence:seq}); if err != nil { return err }
+	if err := os.MkdirAll(filepath.Dir(s.cfg.Checkpoint),0750); err != nil { return err }
+	tmp := s.cfg.Checkpoint+".tmp"; if err := os.WriteFile(tmp,append(data,'\n'),0640); err != nil { return err }; if err := os.Rename(tmp,s.cfg.Checkpoint); err != nil { return err }; s.lastSent=seq; return nil
 }
