@@ -21,38 +21,64 @@ type journalRecord struct {
 	RTUS string `json:"__REALTIME_TIMESTAMP"`
 }
 
-// Recover reads systemd's journal for configured units during a D-Bus gap.
-// journalctl's __REALTIME_TIMESTAMP is in microseconds since Unix epoch; the
-// event model exports milliseconds, preserving sub-second ordering internally
-// as far as the current model permits.
+// Recover reads systemd's journal for configured units during a D-Bus gap or
+// exporter downtime. Use absolute RFC3339 timestamps for journalctl so the
+// requested recovery window is explicit and is not reduced to whole seconds.
 func Recover(ctx context.Context, services []string, from, to time.Time) ([]model.Event, error) {
 	if to.Before(from) { return nil, nil }
 	var out []model.Event
 	for _, service := range services {
-		events, err := recoverUnit(ctx, service, from, to); if err != nil { return nil, err }
+		events, err := recoverUnit(ctx, service, from, to)
+		if err != nil { return nil, err }
 		out = append(out, events...)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].EventTimeUnixMS < out[j].EventTimeUnixMS })
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].EventTimeUnixMS == out[j].EventTimeUnixMS { return out[i].Service < out[j].Service }
+		return out[i].EventTimeUnixMS < out[j].EventTimeUnixMS
+	})
 	return out, nil
 }
 
 func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]model.Event, error) {
-	args := []string{"-u", service, "--since", fmt.Sprintf("@%d", from.Unix()), "--until", fmt.Sprintf("@%d", to.Unix()), "-o", "json", "--no-pager", "--quiet"}
+	args := []string{
+		"-u", service,
+		"--since", from.Format(time.RFC3339Nano),
+		"--until", to.Format(time.RFC3339Nano),
+		"-o", "json",
+		"--no-pager",
+		"--quiet",
+	}
 	cmd := exec.CommandContext(ctx, "journalctl", args...)
-	stdout, err := cmd.StdoutPipe(); if err != nil { return nil, err }
+	stdout, err := cmd.StdoutPipe()
+	if err != nil { return nil, err }
 	if err := cmd.Start(); err != nil { return nil, fmt.Errorf("journalctl %s: %w", service, err) }
+
 	var out []model.Event
-	scanner := bufio.NewScanner(stdout); scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		var r journalRecord
 		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil { continue }
-		state, ok := messageState(r.Message); if !ok { continue }
+		state, ok := messageState(r.Message)
+		if !ok { continue }
 		if r.Unit != "" && r.Unit != service { continue }
-		us := parseTimestampUS(r.RTUS); if us == 0 { continue }
-		t := time.Unix(0, us*1000); if t.Before(from) || t.After(to) { continue }
-		out = append(out, model.Event{Service: service, State: state, EventTimeUnixMS: us / 1000, BootID: r.BootID, Source: model.SourceRecovery, SystemdActiveState: state.String()})
+		us := parseTimestampUS(r.RTUS)
+		if us == 0 { continue }
+		t := time.Unix(0, us*1000)
+		if t.Before(from) || t.After(to) { continue }
+		out = append(out, model.Event{
+			Service: service,
+			State: state,
+			EventTimeUnixMS: us / 1000,
+			BootID: r.BootID,
+			Source: model.SourceRecovery,
+			SystemdActiveState: state.String(),
+		})
 	}
-	if err := scanner.Err(); err != nil { _ = cmd.Process.Kill(); return nil, err }
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Process.Kill()
+		return nil, err
+	}
 	if err := cmd.Wait(); err != nil { return nil, fmt.Errorf("journalctl %s: %w", service, err) }
 	return out, nil
 }
@@ -62,7 +88,7 @@ func messageState(message string) (model.AvailabilityState, bool) {
 	switch {
 	case strings.HasPrefix(m, "started "):
 		return model.StateUp, true
-	case strings.HasPrefix(m, "stopped ") || strings.HasPrefix(m, "failed to start "):
+	case strings.HasPrefix(m, "stopped "), strings.HasPrefix(m, "failed to start "):
 		return model.StateDown, true
 	default:
 		return model.StateUnknown, false
