@@ -71,6 +71,11 @@ func main() {
 	<-ctx.Done(); _ = server.Shutdown(context.Background())
 }
 
+// currentState deliberately uses the same strict availability rule as the
+// engine: only ActiveState="active" is UP; every other state is DOWN.
 func currentState(active string) model.AvailabilityState {
-	switch active { case "active", "activating": return model.StateUp; case "inactive", "failed", "deactivating": return model.StateDown; default: return model.StateUnknown }
+	if active == "active" {
+		return model.StateUp
+	}
+	return model.StateDown
 }
