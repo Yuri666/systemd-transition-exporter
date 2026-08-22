@@ -44,21 +44,30 @@ func main() {
 	}
 
 	walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
+	var durableEvents []model.Event
 	if cfg.WAL.Enabled {
 		if events, e := wal.ReadAll(walPath); e == nil {
+			durableEvents = events
 			for _, event := range events { eng.Replay(event); reg.Event(event) }
 			if len(events) > 0 { log.Printf("replayed %d durable transition events from WAL", len(events)) }
 		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
 	}
 
-	// Recover transitions that happened while the exporter itself was stopped.
-	// Always use the configured startup recovery window. Using the oldest WAL
-	// event as the lower boundary is incorrect: the engine has already replayed
-	// the WAL and therefore treats those historical events as known. The startup
-	// window deliberately overlaps the WAL history; Engine.ApplyRecovery filters
-	// duplicates by timestamp while importing events that happened after the
-	// last durable event for each service.
+	// Recover the period in which the exporter itself was stopped. If a WAL is
+	// available, start at its oldest durable event. This deliberately overlaps
+	// the WAL history: Engine.ApplyRecovery drops events already restored from
+	// the WAL, while accepting newer journal events. Using time.Now() as the
+	// lower boundary loses transitions that happened just before startup.
 	startupFrom := time.Now().Add(-cfg.Systemd.StartupRecoveryInterval)
+	if len(durableEvents) > 0 {
+		oldest := durableEvents[0].EventTimeUnixMS
+		for _, event := range durableEvents[1:] {
+			if event.EventTimeUnixMS < oldest { oldest = event.EventTimeUnixMS }
+		}
+		// journalctl is queried at second precision. Include one extra second
+		// before the oldest durable event to avoid a boundary loss.
+		startupFrom = time.UnixMilli(oldest).Add(-time.Second)
+	}
 	startupTo := time.Now()
 	log.Printf("starting journal recovery window from=%s to=%s", startupFrom.Format(time.RFC3339Nano), startupTo.Format(time.RFC3339Nano))
 	if events, e := recovery.Recover(ctx, cfg.Services, startupFrom, startupTo); e != nil {
