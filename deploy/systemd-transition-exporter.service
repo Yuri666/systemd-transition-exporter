@@ -1,0 +1,21 @@
+[Unit]
+Description=Systemd Service Transition Exporter
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/systemd-transition-exporter --config /etc/systemd-transition-exporter/config.yaml
+Restart=always
+RestartSec=2s
+
+User=systemd-transition-exporter
+Group=systemd-transition-exporter
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/systemd-transition-exporter
+
+[Install]
+WantedBy=multi-user.target
