@@ -63,3 +63,25 @@ func TestRestartWithSameBootDoesNotInventTransition(t *testing.T) {
 		t.Fatalf("unchanged snapshot emitted %+v", got)
 	}
 }
+
+func TestOnlyActiveIsUp(t *testing.T) {
+	states := []string{"inactive", "activating", "deactivating", "failed", "reloading", "maintenance", "unknown", ""}
+	for _, activeState := range states {
+		e := New()
+		e.Apply(snapshot("test.service", activeState, 1000, 0))
+		state, ok := e.State("test.service")
+		if !ok {
+			t.Fatalf("state missing for %q", activeState)
+		}
+		if state.Availability != model.StateDown {
+			t.Fatalf("ActiveState=%q mapped to %v, want down", activeState, state.Availability)
+		}
+	}
+
+	e := New()
+	e.Apply(snapshot("test.service", "active", 1000, 0))
+	state, _ := e.State("test.service")
+	if state.Availability != model.StateUp {
+		t.Fatalf("ActiveState=active mapped to %v, want up", state.Availability)
+	}
+}
