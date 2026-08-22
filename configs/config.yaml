@@ -14,3 +14,15 @@ wal:
   enabled: true
   directory: /var/lib/systemd-transition-exporter/wal
   fsync: true
+
+# Export historical service-state transitions to Prometheus with the original
+# systemd event timestamp. The exporter does not use Prometheus scrape time
+# for these samples.
+remote_write:
+  enabled: false
+  url: "http://127.0.0.1:9090/api/v1/write"
+  batch_size: 100
+  flush_interval: 1s
+  retry_interval: 1s
+  timeout: 10s
+  checkpoint: /var/lib/systemd-transition-exporter/remote_write.checkpoint
