@@ -26,8 +26,7 @@ func main() {
 	cfg, err := config.Load(*configPath); if err != nil { log.Fatal(err) }
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM); defer stop()
 
-	eng := engine.New()
-	reg := metrics.New()
+	eng := engine.New(); reg := metrics.New()
 	var eventLog *wal.WAL
 	if cfg.WAL.Enabled {
 		eventLog, err = wal.Open(cfg.WAL.Directory, cfg.WAL.Fsync); if err != nil { log.Fatal(err) }
@@ -38,13 +37,11 @@ func main() {
 			if len(events) > 0 { log.Printf("replayed %d durable transition events from WAL", len(events)) }
 		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
 	}
-
 	persist := func(event model.Event) error { if eventLog != nil { return eventLog.Append(event) }; return nil }
 	onSnapshot := func(s model.UnitSnapshot) error {
 		for _, event := range eng.Apply(s) {
 			if err := persist(event); err != nil { return err }
-			reg.Event(event)
-			log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
+			reg.Event(event); log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 		}
 		reg.SetState(s.Service, currentState(s.ActiveState)); return nil
 	}
@@ -58,10 +55,8 @@ func main() {
 				log.Printf("recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 			}
 		}
-		log.Printf("journal recovery completed: candidates=%d imported=%d", len(events), count)
-		return nil
+		log.Printf("journal recovery completed: candidates=%d imported=%d", len(events), count); return nil
 	}
-
 	mux := http.NewServeMux(); mux.HandleFunc("/metrics", reg.Handler)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -76,4 +71,6 @@ func main() {
 	<-ctx.Done(); _ = server.Shutdown(context.Background())
 }
 
-func currentState(active string) model.AvailabilityState { if active == "active" { return model.StateUp }; return model.StateDown }
+func currentState(active string) model.AvailabilityState {
+	switch active { case "active", "activating": return model.StateUp; case "inactive", "failed", "deactivating": return model.StateDown; default: return model.StateUnknown }
+}
