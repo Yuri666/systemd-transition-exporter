@@ -38,6 +38,48 @@ func main() {
 		defer eventLog.Close()
 	}
 
+	persist := func(event model.Event) error {
+		if eventLog != nil { if err := eventLog.Append(event); err != nil { return err } }
+		return nil
+	}
+
+	walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
+	var durableEvents []model.Event
+	if cfg.WAL.Enabled {
+		if events, e := wal.ReadAll(walPath); e == nil {
+			durableEvents = events
+			for _, event := range events { eng.Replay(event); reg.Event(event) }
+			if len(events) > 0 { log.Printf("replayed %d durable transition events from WAL", len(events)) }
+		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
+	}
+
+	// Recover transitions that happened while the exporter itself was stopped.
+	// If the WAL has history, use its oldest event as the safe lower boundary so
+	// every configured service is covered. With no history, use the configurable
+	// startup recovery window.
+	startupFrom := time.Now().Add(-cfg.Systemd.StartupRecoveryInterval)
+	if len(durableEvents) > 0 {
+		startupFrom = time.UnixMilli(durableEvents[0].EventTimeUnixMS)
+		for _, event := range durableEvents[1:] {
+			if t := time.UnixMilli(event.EventTimeUnixMS); t.Before(startupFrom) { startupFrom = t }
+		}
+	}
+	startupTo := time.Now()
+	if events, e := recovery.Recover(ctx, cfg.Services, startupFrom, startupTo); e != nil {
+		log.Printf("startup journal recovery failed: %v", e)
+	} else {
+		imported := 0
+		for _, recovered := range events {
+			for _, event := range eng.ApplyRecovery(recovered) {
+				if err := persist(event); err != nil { log.Fatalf("persist startup recovery event: %v", err) }
+				reg.Event(event)
+				imported++
+				log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
+			}
+		}
+		if len(events) > 0 || imported > 0 { log.Printf("startup journal recovery completed: candidates=%d imported=%d", len(events), imported) }
+	}
+
 	rw, err := remote_write.New(remote_write.Config{
 		Enabled: cfg.RemoteWrite.Enabled, URL: cfg.RemoteWrite.URL,
 		BatchSize: cfg.RemoteWrite.BatchSize, FlushInterval: cfg.RemoteWrite.FlushInterval,
@@ -51,7 +93,6 @@ func main() {
 	stateQueue := make(chan model.ServiceState, 10000)
 	if rw != nil {
 		go func() {
-			walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
 			if cfg.WAL.Enabled {
 				if events, e := wal.ReadAll(walPath); e == nil {
 					if e := rw.Send(ctx, events); e != nil && ctx.Err() == nil { log.Printf("remote_write recovery stopped: %v", e) }
@@ -61,28 +102,20 @@ func main() {
 			batch := make([]model.Event, 0, cfg.RemoteWrite.BatchSize)
 			timer := time.NewTicker(cfg.RemoteWrite.FlushInterval)
 			stateTimer := time.NewTicker(cfg.RemoteWrite.StateInterval)
-			defer timer.Stop()
-			defer stateTimer.Stop()
+			defer timer.Stop(); defer stateTimer.Stop()
 
 			flush := func() {
 				if len(batch) == 0 { return }
 				if e := rw.Send(ctx, batch); e != nil && ctx.Err() == nil { log.Printf("remote_write send failed: %v", e) } else { batch = batch[:0] }
 			}
 			drainEvents := func() {
-				for {
-					select {
-					case e := <-eventQueue: batch = append(batch, e)
-					default: return
-					}
-				}
+				for { select { case e := <-eventQueue: batch = append(batch, e); default: return } }
 			}
 			sendQueuedStates := func() {
 				for {
 					select {
 					case state := <-stateQueue:
-						if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil {
-							log.Printf("remote_write startup state failed for %s: %v", state.Service, e)
-						}
+						if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
 					default: return
 					}
 				}
@@ -94,17 +127,10 @@ func main() {
 					batch = append(batch, e)
 					if len(batch) >= cfg.RemoteWrite.BatchSize { flush() }
 				case state := <-stateQueue:
-					// A startup/current snapshot is a state sample, not a transition.
-					// Send it immediately so Prometheus sees the series without waiting
-					// for the first state_interval tick.
-					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write startup state failed for %s: %v", state.Service, e)
-					}
+					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
 				case <-timer.C:
 					drainEvents(); flush()
 				case <-stateTimer.C:
-					// Drain and flush transitions first. This prevents a current-state
-					// heartbeat from overtaking transitions already queued for delivery.
 					drainEvents(); flush(); sendQueuedStates()
 					states := make([]model.ServiceState, 0, len(cfg.Services))
 					for _, service := range cfg.Services { if st, ok := eng.State(service); ok { states = append(states, st) } }
@@ -116,18 +142,10 @@ func main() {
 		}()
 	}
 
-	persist := func(event model.Event) error {
+	persist = func(event model.Event) error {
 		if eventLog != nil { if err := eventLog.Append(event); err != nil { return err } }
 		if rw != nil { select { case eventQueue <- event: default: log.Printf("remote_write queue full; event seq=%d remains durable in WAL", event.Sequence) } }
 		return nil
-	}
-
-	walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
-	if cfg.WAL.Enabled {
-		if events, e := wal.ReadAll(walPath); e == nil {
-			for _, event := range events { eng.Replay(event); reg.Event(event) }
-			if len(events) > 0 { log.Printf("replayed %d durable transition events from WAL", len(events)) }
-		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
 	}
 
 	onSnapshot := func(s model.UnitSnapshot) error {
@@ -139,9 +157,7 @@ func main() {
 		state := model.ServiceState{Service: s.Service, Availability: currentState(s.ActiveState), ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID}
 		if existing, ok := eng.State(s.Service); ok { state = existing }
 		reg.SetState(s.Service, state.Availability)
-		if rw != nil {
-			select { case stateQueue <- state: default: log.Printf("remote_write state queue full; startup state for %s will be sent at next state_interval", s.Service) }
-		}
+		if rw != nil { select { case stateQueue <- state: default: log.Printf("remote_write state queue full; startup state for %s will be sent at next state_interval", s.Service) } }
 		return nil
 	}
 
