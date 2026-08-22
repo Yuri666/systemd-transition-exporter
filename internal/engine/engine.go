@@ -105,11 +105,8 @@ func (e *Engine) ApplyReboot(bootID string, eventTime time.Time) []model.Event {
 func (e *Engine) Sequence() uint64 { e.mu.Lock(); defer e.mu.Unlock(); return e.seq }
 
 // availability deliberately uses a strict mapping: only systemd ActiveState
-// "active" is considered UP. Every other ActiveState is DOWN, including
-// activating, deactivating, failed, inactive, reloading and unknown states.
+// "active" is considered UP. Every other ActiveState is DOWN.
 func availability(activeState string) model.AvailabilityState {
-	if activeState == "active" {
-		return model.StateUp
-	}
+	if activeState == "active" { return model.StateUp }
 	return model.StateDown
 }
