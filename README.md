@@ -2,7 +2,7 @@
 
 Prometheus exporter for monitoring selected systemd services and recording **service state transitions** with systemd timestamps.
 
-The project is intended for availability/KPI calculations where it is not sufficient to expose only the current `ActiveState`. The important data is the sequence and exact time of transitions such as:
+The project is intended for availability/KPI calculations where current `ActiveState` alone is insufficient. The important data is the sequence and time of transitions such as:
 
 ```text
 UP   -> DOWN @ 12:01:10
@@ -11,98 +11,99 @@ UP   -> DOWN @ 12:03:40
 DOWN -> UP   @ 12:04:00
 ```
 
-The exporter is designed for IMS infrastructure such as `pcscf.service`, `scscf.service`, and `icscf.service`, but it is not limited to those units.
+The exporter is intended for IMS infrastructure such as `pcscf.service`, `scscf.service`, and `icscf.service`, but is not limited to those units.
 
 ## Current implementation status
 
-This repository is being developed in phases.
+Implemented:
 
-Implemented in the current phase:
-
-- YAML configuration.
-- Go CLI under `cmd/systemd-transition-exporter`.
+- YAML configuration and Go CLI.
 - systemd D-Bus access through `github.com/godbus/dbus/v5`.
 - Monitoring of configured units through `PropertiesChanged`.
-- Exact transition timestamps taken from systemd `ActiveEnterTimestamp` / `ActiveExitTimestamp` and monotonic counterparts.
+- Transition timestamps from systemd `ActiveEnterTimestamp` / `ActiveExitTimestamp` and monotonic counterparts.
 - State engine with monotonically increasing event sequence numbers.
-- Detection of a host reboot through `/proc/sys/kernel/random/boot_id`.
-- Host reboot is treated as service downtime for services that were UP before reboot.
-- D-Bus health checking with `org.freedesktop.DBus.Peer.Ping` on the **systemd manager peer** (`org.freedesktop.systemd1`, `/org/freedesktop/systemd1`).
-- D-Bus reconnect loop.
-- Separate D-Bus connectivity metrics. D-Bus loss does **not** automatically turn a monitored service DOWN.
+- D-Bus reconnect after a real connection loss.
+- Separate D-Bus connectivity metrics.
 - Durable JSONL WAL for detected transition events.
+- WAL replay on collector startup, restoring event counters, last state and sequence number.
+- Journald recovery reader for transitions occurring during a detected D-Bus outage.
+- Deduplication of recovered records against the already processed event stream.
 - Prometheus `/metrics`, `/health`, and `/ready` endpoints.
 - systemd deployment unit.
 
-Not yet production-complete:
+Still requiring production hardening:
 
-- journald-based recovery of transitions that occurred while D-Bus was unavailable;
-- durable WAL replay/checkpointing and bounded WAL rotation;
-- final Prometheus metric model for exposing every transition/recovery event;
+- reboot-gap reconciliation across old and new boots;
+- WAL checkpoints, segmentation and bounded retention;
+- complete remote-write delivery/replay layer;
 - full integration tests against a real systemd instance;
 - packaging and installation automation.
 
-## Important design rule: D-Bus loss is not service downtime
+## Critical design rules
 
-A D-Bus outage means that the collector temporarily cannot observe systemd. It does not prove that the monitored service stopped.
+### D-Bus loss is not service downtime
 
-Therefore the exporter keeps the last known service state while D-Bus is unavailable and exposes D-Bus connectivity separately:
+A D-Bus outage means that the collector temporarily cannot observe systemd. It does **not** prove that a monitored service stopped.
+
+Therefore:
 
 ```text
 systemd service state        -> service availability
 system D-Bus connectivity    -> collector observability
 ```
 
-After reconnect, reconciliation restores the current systemd state. Future work in `internal/journal` will recover the complete transition history from the gap.
+The exporter keeps the last known service state while D-Bus is unavailable. When the connection returns, the journal is used to recover the transition history observed during the gap.
+
+### D-Bus timeout is not D-Bus disconnect
+
+A slow systemd operation must not cause a false D-Bus outage. The collector therefore does not use an application-level `Peer.Ping` timeout as the transport disconnect detector.
+
+The godbus connection context is used instead. `godbus` documents `Conn.Context()` as the context cancelled when the connection is closed and `Conn.Connected()` as the connection-state check. urlgodbus/dbus conn.gohttps://github.com/godbus/dbus/blob/master/conn.go
+
+This distinction is important for service operations: starting/stopping a unit can temporarily make systemd slower without meaning that the D-Bus transport was lost.
 
 ## Architecture
 
 ```text
-                    systemd
-                       |
-                 system D-Bus
-                       |
-          +------------+-------------+
-          |                          |
-    PropertiesChanged          systemd Peer.Ping()
-          |                          |
-          +------------+-------------+
-                       |
-                internal/systemd
-                       |
-                       v
-                 state snapshot
-                       |
-                       v
-                 internal/engine
-                       |
-              transition events
-                  /         \
-                 v           v
-          internal/wal    internal/metrics
-                 |           |
-                 v           v
-             durable      /metrics
-              events
+                         systemd
+                            |
+                     system D-Bus
+                            |
+                  PropertiesChanged
+                            |
+                            v
+                    internal/systemd
+                            |
+                            v
+                     state snapshots
+                            |
+                            v
+                     internal/engine
+                            |
+                    transition events
+                       /          \
+                      v            v
+               internal/wal    internal/metrics
+                      |             |
+                      v             v
+                  durable       /metrics
+                   events
+
+D-Bus outage:
+
+       systemd journal
+             |
+             v
+      internal/recovery
+             |
+             v
+      missing transitions
+             |
+             v
+       engine -> WAL -> metrics
 ```
 
-The planned recovery path is:
-
-```text
-D-Bus outage
-     |
-     v
-systemd journal
-     |
-     v
-internal/journal
-     |
-     v
-recovered events
-     |
-     v
-state engine + WAL + metrics
-```
+The WAL is the durable boundary for events already accepted by the collector. The journal is the historical source used to fill a D-Bus observation gap.
 
 ## Repository layout
 
@@ -121,11 +122,13 @@ internal/systemd/
     resilient.go             connection lifecycle and reconnect
 
 internal/engine/
-    engine.go                transition detection
-    engine_test.go           state-engine tests
+    engine.go                transition detection, replay and recovery
 
 internal/wal/
     wal.go                   durable JSONL event log
+
+internal/recovery/
+    journal.go               systemd journal recovery reader
 
 internal/metrics/
     metrics.go               Prometheus exposition
@@ -139,35 +142,21 @@ deploy/
 
 ## Building
 
-### Go package build check
-
-This command checks and builds all Go packages:
+Package validation:
 
 ```bash
 go test ./...
 go build ./...
 ```
 
-**Important:** `go build ./...` is a package build check. With multiple packages, it is not the command to rely on for the location/name of the final executable.
-
-### Build the actual executable
-
-Use:
+`go build ./...` validates/builds packages. To create the actual executable use:
 
 ```bash
 mkdir -p bin
 go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 ```
 
-The executable will then be:
-
-```text
-bin/systemd-transition-exporter
-```
-
-### Makefile
-
-The repository also provides convenient targets:
+The repository Makefile provides:
 
 ```bash
 make test
@@ -176,17 +165,11 @@ make check
 make clean
 ```
 
-`make build` produces:
-
-```text
-bin/systemd-transition-exporter
-```
-
-`make check` runs tests and then builds that executable explicitly.
+`make check` runs tests and builds `bin/systemd-transition-exporter` explicitly.
 
 ## Configuration
 
-Example: `configs/config.yaml`:
+Example `configs/config.yaml`:
 
 ```yaml
 server:
@@ -207,61 +190,24 @@ wal:
   fsync: true
 ```
 
-### `server.listen`
+`server.listen` is the HTTP listen address. `services` contains the systemd units to monitor. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect.
 
-HTTP listen address. The default is `127.0.0.1:9877` if omitted.
+`reconciliation_interval` is retained as a configuration field for the planned periodic reconciliation mechanism; journal recovery is currently triggered directly after a detected D-Bus gap.
 
-### `services`
-
-List of systemd unit names to monitor. At least one unit is required.
-
-Example:
-
-```yaml
-services:
-  - pcscf.service
-```
-
-### `systemd.reconnect_interval`
-
-Delay between reconnect attempts after an established D-Bus connection is lost. The current default is `1s`.
-
-### `systemd.reconciliation_interval`
-
-Reserved for the periodic reconciliation mechanism. The complete periodic reconciliation/recovery implementation will be completed together with journal recovery.
-
-### `wal.enabled`
-
-Enables durable event logging.
-
-### `wal.directory`
-
-Directory containing the event WAL. The current implementation uses:
+`wal.enabled`, `wal.directory` and `wal.fsync` control the durable event log. The current WAL file is:
 
 ```text
-<directory>/events.jsonl
+<wal.directory>/events.jsonl
 ```
-
-### `wal.fsync`
-
-When enabled, each appended event is followed by `fsync`. This provides stronger durability at the cost of additional I/O.
 
 ## Running manually
 
-For a locally built executable:
-
 ```bash
+go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 ./bin/systemd-transition-exporter --config ./configs/config.yaml
 ```
 
-For the default production configuration path:
-
-```bash
-./bin/systemd-transition-exporter \
-  --config /etc/systemd-transition-exporter/config.yaml
-```
-
-The HTTP endpoint is then available at:
+The metrics endpoint is:
 
 ```text
 http://127.0.0.1:9877/metrics
@@ -269,15 +215,13 @@ http://127.0.0.1:9877/metrics
 
 ## Prometheus metrics
 
-### Service state
-
-Current state:
+Current service state:
 
 ```text
 systemd_service_state{service="pcscf.service"} 1
 ```
 
-`1` means UP/active and `0` means DOWN/inactive according to the current availability mapping.
+`1` means UP/active and `0` means DOWN/inactive according to the availability mapping.
 
 Transition counters:
 
@@ -292,7 +236,7 @@ Last transition timestamp:
 systemd_service_last_transition_timestamp_seconds{service="pcscf.service"} ...
 ```
 
-### D-Bus connectivity
+D-Bus connectivity:
 
 ```text
 systemd_transition_exporter_dbus_connected 1
@@ -307,22 +251,9 @@ During a real D-Bus outage:
 systemd_transition_exporter_dbus_connected 0
 ```
 
-The service state is intentionally not changed just because D-Bus is unavailable.
+The service state is intentionally not changed merely because D-Bus is unavailable.
 
-## D-Bus monitoring
-
-The exporter does not infer D-Bus loss from the absence of systemd signals. It actively checks the **systemd D-Bus manager peer** with:
-
-```text
-destination: org.freedesktop.systemd1
-object path: /org/freedesktop/systemd1
-interface:  org.freedesktop.DBus.Peer
-method:     Ping
-```
-
-This is deliberately not a `Peer.Ping` call to the `org.freedesktop.DBus` bus-daemon destination. Some hosts apply D-Bus policy that rejects that call even though the connection is healthy. The health check therefore targets the actual systemd manager object.
-
-The current health-check interval is 1 second and the current ping timeout is 500 ms.
+## D-Bus monitoring and reconnect
 
 The connection lifecycle is:
 
@@ -339,41 +270,57 @@ Load configured units
 Install PropertiesChanged match
    |
    v
-systemd Peer.Ping
+Initial snapshots
    |
    v
 CONNECTED
    |
-   +---- PropertiesChanged ----> snapshot -> engine
+   +---- PropertiesChanged ---> snapshot -> engine -> WAL
    |
-   +---- Ping/transport error -> DISCONNECTED
+   +---- connection context ---> DISCONNECTED
                                   |
                                   v
                                reconnect
+                                  |
+                                  v
+                           journal recovery
 ```
+
+There is deliberately **no `Peer.Ping` timeout in this state machine**. This prevents the false disconnect observed when a service start/stop temporarily made systemd busy.
 
 Initial connection/setup errors are logged as errors and are not counted as a loss of an already-established connection.
 
 ## Transition timestamps
 
-The exporter uses systemd properties:
+The exporter uses:
 
 - `ActiveEnterTimestamp`;
 - `ActiveExitTimestamp`;
 - `ActiveEnterTimestampMonotonic`;
 - `ActiveExitTimestampMonotonic`.
 
-Wall-clock transition timestamps are stored in microseconds internally and exported in seconds where Prometheus requires seconds.
-
-Monotonic timestamps are retained in the event model for ordering and diagnostic purposes.
+Wall-clock timestamps are retained internally in microseconds and exported in seconds for Prometheus metrics. The event model also retains monotonic timestamps when available.
 
 ## Multiple transitions between observations
 
-The engine can compare the previous and current systemd enter/exit timestamps and emit newly observed transitions in timestamp order.
+The engine compares the previous and current systemd enter/exit timestamps and can emit multiple newly observed transitions in chronological order.
 
-However, systemd unit properties only retain the timestamps represented by the current unit state. They are not a complete historical event log. Therefore the final design cannot rely on D-Bus snapshots alone to recover an arbitrary number of transitions during a monitoring gap.
+However, systemd unit properties are not a historical event log. If D-Bus is unavailable, the current unit properties cannot reconstruct arbitrary `stop/start` cycles. That is why the exporter now queries journald after reconnect and imports `Started`/`Stopped`/`Failed` records from the outage interval.
 
-That is the reason journald recovery is a required next phase.
+Recovered records receive normal collector sequence numbers and are persisted to the same WAL. Records whose timestamp is not newer than the last processed event for the service are ignored, making overlap between realtime D-Bus events and journal recovery safe.
+
+## WAL and restart recovery
+
+When WAL is enabled, startup replays `events.jsonl` before D-Bus monitoring begins. This restores:
+
+- the last known service availability state;
+- transition counters;
+- the last processed event timestamp;
+- the durable sequence number.
+
+This prevents sequence numbers from restarting at `1` after a collector restart and prevents Prometheus metrics from being reset merely because the exporter process was restarted.
+
+The current WAL is intentionally simple append-only JSONL. Checkpointing, segmentation and bounded retention are production-hardening work still to be completed.
 
 ## Host reboot
 
@@ -383,34 +330,9 @@ The exporter reads:
 /proc/sys/kernel/random/boot_id
 ```
 
-A boot ID change identifies a host reboot. Reboot is explicitly treated as downtime for services that were UP before the reboot.
+A boot ID change identifies a host reboot. Reboot is a required downtime condition: services that were UP before the reboot must be represented as DOWN during the reboot interval.
 
-Conceptually:
-
-```text
-pcscf UP
-scscf UP
-
-       HOST REBOOT
-            |
-            v
-pcscf DOWN
-scscf DOWN
-```
-
-When systemd starts the services again, normal systemd transition events establish the subsequent UP timestamps.
-
-## WAL
-
-The current WAL is append-only JSON Lines:
-
-```text
-/var/lib/systemd-transition-exporter/wal/events.jsonl
-```
-
-Each record contains the event sequence, service, state, wall-clock timestamp, monotonic timestamp, boot ID, source and systemd state information.
-
-The WAL currently provides durable storage of events already detected by the collector. It is not yet the complete remote-write queue/replay mechanism from the final design.
+The final reboot reconciliation must preserve the previous boot's last service state and recover the first post-boot `Started` event. This is the next hardening step after the current journal-gap recovery implementation.
 
 ## systemd installation
 
@@ -420,19 +342,14 @@ The deployment unit is:
 deploy/systemd-transition-exporter.service
 ```
 
-It expects the binary at:
+It expects:
 
 ```text
 /usr/local/bin/systemd-transition-exporter
-```
-
-and configuration at:
-
-```text
 /etc/systemd-transition-exporter/config.yaml
 ```
 
-A typical installation sequence is:
+Example installation:
 
 ```bash
 sudo install -d /etc/systemd-transition-exporter
@@ -442,7 +359,7 @@ sudo install -m 0644 configs/config.yaml /etc/systemd-transition-exporter/config
 sudo install -m 0644 deploy/systemd-transition-exporter.service /etc/systemd/system/systemd-transition-exporter.service
 ```
 
-Create the service account before starting the unit:
+Create the service account and grant ownership of the WAL directory:
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin systemd-transition-exporter
@@ -457,9 +374,9 @@ sudo systemctl enable --now systemd-transition-exporter
 sudo systemctl status systemd-transition-exporter
 ```
 
-## Prometheus scrape configuration
+The account must have sufficient access to the system D-Bus and journal. On systems with restrictive D-Bus/journald policy, those permissions must be configured explicitly.
 
-Example:
+## Prometheus scrape configuration
 
 ```yaml
 scrape_configs:
@@ -470,28 +387,36 @@ scrape_configs:
           - "127.0.0.1:9877"
 ```
 
-The exporter is intentionally designed so that Prometheus does not need to poll systemd every second. The collector observes transitions continuously and persists the detected events independently of the Prometheus scrape interval.
+The collector observes transitions continuously, so Prometheus does not need to poll systemd every second. Prometheus can scrape once per minute while the collector preserves transition facts independently.
 
-## Development workflow
+## Recovery test scenario
 
-Before committing changes:
+The intended resilience test is:
 
-```bash
-make check
+```text
+1. collector connected to D-Bus
+2. force real D-Bus outage
+3. stop/start a monitored service several times
+4. restore D-Bus
+5. verify every stop/start appears in WAL and metrics
 ```
 
-which is equivalent to running the package tests and building the actual executable.
+For example, during a five-minute gap:
 
-For a clean rebuild:
-
-```bash
-make clean
-make check
+```text
+DOWN @ 12:00:30
+UP   @ 12:00:40
+DOWN @ 12:01:10
+UP   @ 12:01:20
+DOWN @ 12:02:00
+UP   @ 12:02:30
 ```
+
+All six events must be recovered after reconnect. A single final `ActiveState=active` is not sufficient.
 
 ## Roadmap
 
-### Phase 1/2 — completed foundation
+### Phase 1/2 — foundation
 
 - project structure;
 - configuration;
@@ -505,29 +430,28 @@ make check
 
 - D-Bus reconnect;
 - explicit D-Bus connectivity metrics;
-- reconciliation after reconnect;
+- no false disconnect on slow systemd calls;
 - host reboot detection.
 
 ### Phase 4 — gap recovery
 
 - journald reader;
-- identify systemd unit start/stop events;
-- recover every transition during a D-Bus outage;
-- deduplicate D-Bus and journal events;
-- preserve exact event timestamps and ordering.
+- recover every `Started`/`Stopped` transition during a D-Bus outage;
+- deduplicate realtime and journal events;
+- persist recovered events in the same WAL.
 
 ### Phase 5 — durable delivery
 
-- WAL replay;
-- checkpoints;
+- WAL checkpoints;
 - WAL rotation/retention;
-- remote-write delivery layer;
-- recovery after collector crash.
+- remote-write delivery/replay;
+- crash recovery hardening.
 
 ### Phase 6 — production hardening
 
-- integration tests against systemd;
+- reboot-gap reconciliation across boot IDs;
+- integration tests against real systemd/journald;
 - load tests with large unit sets;
 - bounded memory usage;
-- security review of D-Bus permissions and systemd sandboxing;
+- security review of D-Bus and journal permissions;
 - packaging.
