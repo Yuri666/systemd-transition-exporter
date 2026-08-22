@@ -16,24 +16,37 @@ import (
 
 type journalRecord struct {
 	Message string `json:"MESSAGE"`
-	Unit string `json:"_SYSTEMD_UNIT"`
-	BootID string `json:"_BOOT_ID"`
-	RTUS string `json:"__REALTIME_TIMESTAMP"`
+	Unit    string `json:"_SYSTEMD_UNIT"`
+	BootID  string `json:"_BOOT_ID"`
+	RTUS    string `json:"__REALTIME_TIMESTAMP"`
 }
 
 // Recover reads systemd's journal for configured units during a D-Bus gap or
-// exporter downtime. Use absolute RFC3339 timestamps for journalctl so the
-// requested recovery window is explicit and is not reduced to whole seconds.
+// exporter downtime. A configured service may legitimately have no journal
+// entries (for example, a unit that has never run on this host); that must not
+// abort recovery for all other services.
 func Recover(ctx context.Context, services []string, from, to time.Time) ([]model.Event, error) {
-	if to.Before(from) { return nil, nil }
+	if to.Before(from) {
+		return nil, nil
+	}
 	var out []model.Event
 	for _, service := range services {
 		events, err := recoverUnit(ctx, service, from, to)
-		if err != nil { return nil, err }
+		if err != nil {
+			// journalctl returns exit status 1 when the unit has no matching
+			// journal entries. Treat that as an empty result and continue with
+			// the remaining configured services.
+			if isNoJournalEntriesError(err) {
+				continue
+			}
+			return nil, err
+		}
 		out = append(out, events...)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].EventTimeUnixMS == out[j].EventTimeUnixMS { return out[i].Service < out[j].Service }
+		if out[i].EventTimeUnixMS == out[j].EventTimeUnixMS {
+			return out[i].Service < out[j].Service
+		}
 		return out[i].EventTimeUnixMS < out[j].EventTimeUnixMS
 	})
 	return out, nil
@@ -50,37 +63,93 @@ func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]mod
 	}
 	cmd := exec.CommandContext(ctx, "journalctl", args...)
 	stdout, err := cmd.StdoutPipe()
-	if err != nil { return nil, err }
-	if err := cmd.Start(); err != nil { return nil, fmt.Errorf("journalctl %s: %w", service, err) }
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("journalctl %s: %w", service, err)
+	}
 
 	var out []model.Event
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		var r journalRecord
-		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil { continue }
+		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
+			continue
+		}
 		state, ok := messageState(r.Message)
-		if !ok { continue }
-		if r.Unit != "" && r.Unit != service { continue }
+		if !ok {
+			continue
+		}
+		if r.Unit != "" && r.Unit != service {
+			continue
+		}
 		us := parseTimestampUS(r.RTUS)
-		if us == 0 { continue }
+		if us == 0 {
+			continue
+		}
 		t := time.Unix(0, us*1000)
-		if t.Before(from) || t.After(to) { continue }
+		if t.Before(from) || t.After(to) {
+			continue
+		}
 		out = append(out, model.Event{
-			Service: service,
-			State: state,
-			EventTimeUnixMS: us / 1000,
-			BootID: r.BootID,
-			Source: model.SourceRecovery,
-			SystemdActiveState: state.String(),
+			Service:             service,
+			State:               state,
+			EventTimeUnixMS:     us / 1000,
+			BootID:              r.BootID,
+			Source:              model.SourceRecovery,
+			SystemdActiveState:  state.String(),
 		})
 	}
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Process.Kill()
 		return nil, err
 	}
-	if err := cmd.Wait(); err != nil { return nil, fmt.Errorf("journalctl %s: %w", service, err) }
+
+	stderrBytes, _ := readAll(stderr)
+	if err := cmd.Wait(); err != nil {
+		if exitCode(err) == 1 {
+			// status 1 is journalctl's normal "no entries" result for a
+			// unit/time range that has no matching records. The caller must
+			// continue recovering other configured units.
+			return nil, fmt.Errorf("journalctl %s: no journal entries: %w", service, err)
+		}
+		if len(stderrBytes) > 0 {
+			return nil, fmt.Errorf("journalctl %s: %s: %w", service, strings.TrimSpace(string(stderrBytes)), err)
+		}
+		return nil, fmt.Errorf("journalctl %s: %w", service, err)
+	}
 	return out, nil
+}
+
+func isNoJournalEntriesError(err error) bool {
+	return strings.Contains(err.Error(), ": no journal entries:")
+}
+
+func exitCode(err error) int {
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+func readAll(r interface{ Read([]byte) (int, error) }) ([]byte, error) {
+	var b []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			b = append(b, buf[:n]...)
+		}
+		if err != nil {
+			return b, err
+		}
+	}
 }
 
 func messageState(message string) (model.AvailabilityState, bool) {
@@ -97,6 +166,8 @@ func messageState(message string) (model.AvailabilityState, bool) {
 
 func parseTimestampUS(s string) int64 {
 	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil || v <= 0 { return 0 }
+	if err != nil || v <= 0 {
+		return 0
+	}
 	return v
 }
