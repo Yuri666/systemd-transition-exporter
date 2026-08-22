@@ -61,9 +61,16 @@ func RunResilient(ctx context.Context, services []string, reconnectInterval time
         }
 
         if onConnectionState != nil { onConnectionState(true, time.Now()) }
-        _ = m.Run(ctx, onSnapshot)
+        // Monitor.Run consumes D-Bus signals and performs transport health checks.
+        // Its callback accepts *Unit, so adapt it to the public snapshot callback.
+        runErr := m.Run(ctx, func(u *Unit) error {
+            s, e := u.Snapshot(bootID)
+            if e != nil { return e }
+            return onSnapshot(s)
+        })
         _ = d.Close()
         if ctx.Err() != nil { return ctx.Err() }
         if onConnectionState != nil { onConnectionState(false, time.Now()) }
+        if runErr != nil { continue }
     }
 }
