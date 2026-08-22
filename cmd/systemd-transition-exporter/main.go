@@ -57,9 +57,17 @@ func main() {
 		}
 		log.Printf("journal recovery completed: candidates=%d imported=%d", len(events), count); return nil
 	}
-	mux := http.NewServeMux(); mux.HandleFunc("/metrics", reg.Handler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", reg.Handler)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	// Debug endpoint closes only this collector's D-Bus connection. It does not
+	// stop or restart the system D-Bus daemon. Automatic reconnect remains active.
+	mux.HandleFunc("/debug/dbus/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+		if !systemd.DebugDisconnect() { http.Error(w, "D-Bus connection is not active", http.StatusServiceUnavailable); return }
+		w.WriteHeader(http.StatusNoContent)
+	})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: mux}
 	go func() { log.Printf("listening on %s", cfg.Server.Listen); if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Printf("HTTP server: %v", err) } }()
 	go func() {
@@ -74,8 +82,6 @@ func main() {
 // currentState deliberately uses the same strict availability rule as the
 // engine: only ActiveState="active" is UP; every other state is DOWN.
 func currentState(active string) model.AvailabilityState {
-	if active == "active" {
-		return model.StateUp
-	}
+	if active == "active" { return model.StateUp }
 	return model.StateDown
 }
