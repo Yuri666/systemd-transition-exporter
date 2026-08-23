@@ -138,7 +138,7 @@ func (s *Sender) sendEventsLocked(ctx context.Context, events []model.Event) err
 			return err
 		}
 		if err := s.saveCheckpoint(batch[len(batch)-1].Sequence); err != nil {
-			return err
+			return fmt.Errorf("persist remote_write checkpoint after successful batch: %w", err)
 		}
 		start = end
 	}
@@ -277,6 +277,17 @@ func (s *Sender) loadCheckpoint() error {
 	return nil
 }
 
+// saveCheckpoint makes the delivery checkpoint durable before returning. The
+// sequence is advanced only after the corresponding Remote Write request has
+// returned a successful 2xx response. The temporary file is synced before the
+// atomic rename and the containing directory is synced afterwards.
+//
+// This closes the ordinary filesystem crash window around checkpoint writes.
+// A crash after the receiver has accepted a request but before this checkpoint
+// is persisted can still cause the same samples to be sent again after restart;
+// Remote Write has no transaction/idempotency primitive that lets the sender
+// eliminate that final ambiguity. Therefore delivery is deliberately
+// at-least-once, with the original sequence/timestamp preserved.
 func (s *Sender) saveCheckpoint(seq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -291,12 +302,44 @@ func (s *Sender) saveCheckpoint(seq uint64) error {
 		return err
 	}
 	tmp := s.cfg.Checkpoint + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0640); err != nil {
-		return err
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
+	if err != nil {
+		return fmt.Errorf("open checkpoint temporary file: %w", err)
+	}
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write checkpoint temporary file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync checkpoint temporary file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close checkpoint temporary file: %w", err)
 	}
 	if err := os.Rename(tmp, s.cfg.Checkpoint); err != nil {
-		return err
+		return fmt.Errorf("rename checkpoint temporary file: %w", err)
 	}
+
+	dir, err := os.Open(filepath.Dir(s.cfg.Checkpoint))
+	if err != nil {
+		return fmt.Errorf("open checkpoint directory: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("sync checkpoint directory: %w", err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("close checkpoint directory: %w", err)
+	}
+
 	s.lastSent = seq
+	ok = true
 	return nil
 }
