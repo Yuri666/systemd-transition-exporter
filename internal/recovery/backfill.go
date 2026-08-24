@@ -13,29 +13,37 @@ import (
 )
 
 // RecoveryWindow returns aligned recovery windows covering [from, to].
-// Windows are anchored at the start of each hour and then repeated by size.
+// The grid is anchored at the start of every hour, so a configured window
+// always starts at HH:00, HH:<N>, ... and resets at the next hour.
 func RecoveryWindow(from, to time.Time, size time.Duration) [][2]time.Time {
 	if size <= 0 || !to.After(from) {
 		return nil
 	}
-	start := alignRecoveryWindow(from, size)
 	var out [][2]time.Time
-	for start.Before(to) {
-		end := start.Add(size)
-		if end.After(to) {
-			end = to
+	hour := time.Date(from.Year(), from.Month(), from.Day(), from.Hour(), 0, 0, 0, from.Location())
+	for !hour.After(to) {
+		for offset := time.Duration(0); offset < time.Hour; offset += size {
+			start := hour.Add(offset)
+			if start.Before(from) && start.Add(size).Before(from) {
+				continue
+			}
+			if start.After(to) {
+				break
+			}
+			end := start.Add(size)
+			if end.After(hour.Add(time.Hour)) {
+				end = hour.Add(time.Hour)
+			}
+			if end.After(to) {
+				end = to
+			}
+			if end.After(start) {
+				out = append(out, [2]time.Time{start, end})
+			}
 		}
-		out = append(out, [2]time.Time{start, end})
-		start = start.Add(size)
+		hour = hour.Add(time.Hour)
 	}
 	return out
-}
-
-func alignRecoveryWindow(t time.Time, size time.Duration) time.Time {
-	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
-	offset := t.Sub(hour)
-	steps := offset / size
-	return hour.Add(steps * size)
 }
 
 // BuildStateBackfill creates timestamped state samples at interval-aligned
@@ -66,8 +74,6 @@ func BuildStateBackfill(ctx context.Context, services []string, start, end time.
 			return nil, err
 		}
 		if !ok {
-			// There is no historical transition from which to establish the
-			// state. Do not invent a value for the recovered interval.
 			continue
 		}
 
@@ -78,11 +84,7 @@ func BuildStateBackfill(ctx context.Context, services []string, start, end time.
 				state = serviceEvents[eventIndex].State
 				eventIndex++
 			}
-			out = append(out, model.StateSample{
-				Service: service,
-				State: state,
-				TimestampUnixMS: ts.UnixMilli(),
-			})
+			out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: ts.UnixMilli()})
 		}
 	}
 
