@@ -28,10 +28,6 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil { log.Fatal(err) }
 
-	// Bind the HTTP listener before starting any exporter work. This makes the
-	// port check atomic with listener creation: if another exporter already
-	// owns the address, this process exits immediately and does not start D-Bus
-	// monitoring, WAL processing, or Remote Write delivery.
 	httpListener, err := net.Listen("tcp", cfg.Server.Listen)
 	if err != nil {
 		log.Fatalf("HTTP server: cannot listen on %s: %v", cfg.Server.Listen, err)
@@ -67,9 +63,7 @@ func main() {
 	startupFrom := time.Now().Add(-cfg.Systemd.StartupRecoveryInterval)
 	if len(durableEvents) > 0 {
 		oldest := durableEvents[0].EventTimeUnixMS
-		for _, event := range durableEvents[1:] {
-			if event.EventTimeUnixMS < oldest { oldest = event.EventTimeUnixMS }
-		}
+		for _, event := range durableEvents[1:] { if event.EventTimeUnixMS < oldest { oldest = event.EventTimeUnixMS } }
 		startupFrom = time.UnixMilli(oldest).Add(-time.Second)
 	}
 	startupTo := time.Now()
@@ -81,8 +75,7 @@ func main() {
 		for _, recovered := range events {
 			for _, event := range eng.ApplyRecovery(recovered) {
 				if err := persist(event); err != nil { _ = httpListener.Close(); log.Fatalf("persist startup recovery event: %v", err) }
-				reg.Event(event)
-				imported++
+				reg.Event(event); imported++
 				log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 			}
 		}
@@ -105,11 +98,8 @@ func main() {
 			defer ticker.Stop()
 			for {
 				select {
-				case <-ticker.C:
-					reg.SetRemoteWriteStats(rw.Stats())
-				case <-ctx.Done():
-					reg.SetRemoteWriteStats(rw.Stats())
-					return
+				case <-ticker.C: reg.SetRemoteWriteStats(rw.Stats())
+				case <-ctx.Done(): reg.SetRemoteWriteStats(rw.Stats()); return
 				}
 			}
 		}()
@@ -129,23 +119,20 @@ func main() {
 			timer := time.NewTicker(cfg.RemoteWrite.FlushInterval)
 			stateTimer := time.NewTicker(cfg.RemoteWrite.StateInterval)
 			defer timer.Stop(); defer stateTimer.Stop()
-
 			flush := func() {
 				if len(batch) == 0 { return }
 				if e := rw.Send(ctx, batch); e != nil && ctx.Err() == nil { log.Printf("remote_write send failed: %v", e) } else { batch = batch[:0] }
 			}
-			drainEvents := func() {
-				for { select { case e := <-eventQueue: batch = append(batch, e); default: return } }
-			}
+			drainEvents := func() { for { select { case e := <-eventQueue: batch = append(batch, e); default: return } } }
 			sendQueuedStates := func() {
-				for {
-					select {
-					case state := <-stateQueue:
-						if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
-					default: return
-					}
+			for {
+				select {
+				case state := <-stateQueue:
+					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
+				default: return
 				}
 			}
+		}
 
 			for {
 				select {
@@ -154,25 +141,26 @@ func main() {
 					if len(batch) >= cfg.RemoteWrite.BatchSize { flush() }
 				case state := <-stateQueue:
 					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
-				case <-timer.C:
-					drainEvents(); flush()
+				case <-timer.C: drainEvents(); flush()
 				case <-stateTimer.C:
 					drainEvents(); flush(); sendQueuedStates()
 					states := make([]model.ServiceState, 0, len(cfg.Services))
 					for _, service := range cfg.Services { if st, ok := eng.State(service); ok { states = append(states, st) } }
 					if e := rw.SendCurrentStates(ctx, states); e != nil && ctx.Err() == nil { log.Printf("remote_write state heartbeat failed: %v", e) }
-				case <-ctx.Done():
-					drainEvents(); flush(); return
+				case <-ctx.Done(): drainEvents(); flush(); return
 				}
 			}
 		}()
 	}
 
-	persist = func(event model.Event) error {
+	persistEvent := func(event model.Event, enqueue bool) error {
 		if eventLog != nil { if err := eventLog.Append(event); err != nil { return err } }
-		if rw != nil { select { case eventQueue <- event: default: log.Printf("remote_write queue full; event seq=%d remains durable in WAL", event.Sequence) } }
+		if enqueue && rw != nil {
+			select { case eventQueue <- event: default: log.Printf("remote_write queue full; event seq=%d remains durable in WAL", event.Sequence) }
+		}
 		return nil
 	}
+	persist = func(event model.Event) error { return persistEvent(event, true) }
 
 	onSnapshot := func(s model.UnitSnapshot) error {
 		for _, event := range eng.Apply(s) {
@@ -188,17 +176,38 @@ func main() {
 	}
 
 	onRecovery := func(from, to time.Time) error {
-		events, err := recovery.Recover(ctx, cfg.Services, from, to)
-		if err != nil { return err }
+		windows := recovery.RecoveryWindow(from, to, cfg.RemoteWrite.RecoveryWindow)
 		count := 0
-		for _, recovered := range events {
-			for _, event := range eng.ApplyRecovery(recovered) {
-				if err := persist(event); err != nil { return err }
-				reg.Event(event); count++
-				log.Printf("recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
+		for _, window := range windows {
+			windowStart, windowEnd := window[0], window[1]
+			events, err := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd)
+			if err != nil { return err }
+
+			recovered := make([]model.Event, 0, len(events))
+			for _, candidate := range events {
+				// Adjacent aligned windows share a boundary. Keep the event in
+				// only the window where its timestamp is strictly before the end.
+				if candidate.EventTimeUnixMS >= windowEnd.UnixMilli() && windowEnd.Before(to) { continue }
+				for _, event := range eng.ApplyRecovery(candidate) {
+					if err := persistEvent(event, false); err != nil { return err }
+					reg.Event(event)
+					recovered = append(recovered, event)
+					count++
+					log.Printf("recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
+				}
+			}
+
+			// Deliver real transitions first, then continuity samples. Both
+			// calls are serialized by Sender.sendMu, preserving per-series order.
+			if rw != nil {
+				if err := rw.Send(ctx, recovered); err != nil { return err }
+				backfill, err := recovery.BuildStateBackfill(ctx, cfg.Services, windowStart, windowEnd, recovered, cfg.RemoteWrite.RecoveryFillInterval)
+				if err != nil { return err }
+				if err := rw.SendRecoveredStates(ctx, backfill); err != nil { return err }
+				if len(backfill) > 0 { log.Printf("recovery state backfill window=%s..%s interval=%s samples=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), cfg.RemoteWrite.RecoveryFillInterval, len(backfill)) }
 			}
 		}
-		log.Printf("journal recovery completed: candidates=%d imported=%d", len(events), count)
+		log.Printf("journal recovery completed: windows=%d candidates/imported=%d", len(windows), count)
 		return nil
 	}
 
