@@ -133,7 +133,7 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 			continue
 		}
 		us := parseTimestampUS(r.RTUS)
-		if us == 0 || us/1000 > uint64(at.UnixMilli()) {
+		if us == 0 || us/1000 > at.UnixMilli() {
 			continue
 		}
 		foundState = state
@@ -144,8 +144,8 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 		_ = cmd.Process.Kill()
 		return model.StateUnknown, false, err
 	}
-	if err := cmd.Wait(); err != nil && exitCode(err) != 1 {
-		return model.StateUnknown, false, fmt.Errorf("journalctl %s: %w", service, err)
+	if err := cmd.Wait(); err != nil {
+		return model.StateUnknown, false, err
 	}
 	return foundState, found, nil
 }
