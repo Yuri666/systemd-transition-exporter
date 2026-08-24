@@ -28,8 +28,16 @@ func TestRecoveryWindowFiveToSixtyMinutesIsRepresentable(t *testing.T) {
 	from := time.Date(2026, 8, 24, 12, 7, 0, 0, loc)
 	to := from.Add(60 * time.Minute)
 	windows := RecoveryWindow(from, to, 60*time.Minute)
-	if len(windows) != 1 || !windows[0][0].Equal(time.Date(2026, 8, 24, 12, 0, 0, 0, loc)) {
-		t.Fatalf("unexpected 60m recovery window: %#v", windows)
+	if len(windows) != 2 {
+		t.Fatalf("got %d windows, want 2", len(windows))
+	}
+	if !windows[0][0].Equal(time.Date(2026, 8, 24, 12, 0, 0, 0, loc)) ||
+		!windows[0][1].Equal(time.Date(2026, 8, 24, 13, 0, 0, 0, loc)) {
+		t.Fatalf("unexpected first 60m recovery window: %#v", windows[0])
+	}
+	if !windows[1][0].Equal(time.Date(2026, 8, 24, 13, 0, 0, 0, loc)) ||
+		!windows[1][1].Equal(to) {
+		t.Fatalf("unexpected second 60m recovery window: %#v", windows[1])
 	}
 }
 
