@@ -32,6 +32,14 @@ remote_write:
   # 5-minute staleness interval; 1m is the recommended default.
   state_interval: 1m
 
+  # During journal recovery, fill each aligned recovery window with the
+  # previous/effective state at this interval. Allowed range: 10s..300s.
+  recovery_fill_interval: 2m
+
+  # Width of each recovered interval. Windows are aligned to the start of
+  # each hour (for example 00:00..00:15, 00:15..00:30). Allowed range: 5m..60m.
+  recovery_window: 15m
+
   # Arbitrary constant labels added to every remote_write time series.
   # 'service' and '__name__' are reserved and must not be configured here.
   labels:
