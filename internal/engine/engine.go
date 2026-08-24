@@ -119,6 +119,18 @@ func (e *Engine) ApplyRecovery(event model.Event) []model.Event {
 	return []model.Event{event}
 }
 
+// AdoptBootID records the current boot without emitting downtime. It is used
+// when the reboot happened before the interval the exporter is allowed to
+// republish, so the boot change must not be mistaken for a fresh transition.
+func (e *Engine) AdoptBootID(bootID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for service, state := range e.states {
+		state.BootID = bootID
+		e.states[service] = state
+	}
+}
+
 func (e *Engine) ApplyReboot(bootID string, eventTime time.Time) []model.Event {
 	e.mu.Lock()
 	defer e.mu.Unlock()

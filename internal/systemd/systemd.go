@@ -46,7 +46,7 @@ func BootID() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read boot_id: %w", err)
 	}
-	return strings.TrimSpace(string(b)), nil
+	return model.CanonicalBootID(string(b)), nil
 }
 
 func BootTime() (time.Time, error) {

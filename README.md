@@ -185,6 +185,7 @@ remote_write:
   timeout: 10s
   checkpoint: /var/lib/systemd-transition-exporter/remote_write.checkpoint
   state_interval: 1m
+  recovery_fill_interval: 1m
   recovery_window: 15m
   labels:
     environment: production
@@ -438,14 +439,27 @@ Systemd unit properties are not a complete historical event log. Therefore trans
 Recovery is deliberately limited to the current local-time slot. With the
 default `remote_write.recovery_window: 15m`, an exporter becoming ready at
 `15:14` reads transition events only from `[15:00, 15:14)`. It queries the
-single latest lifecycle event before `15:00` to establish the baseline state.
-An outage beginning at `14:47` does not cause the closed `14:45..15:00` slot
-to be rewritten; the excluded 13 minutes are exposed as
+single latest lifecycle event before `15:00` to establish the state at the slot
+start. An outage beginning at `14:47` does not cause the closed `14:45..15:00`
+slot to be rewritten; the excluded 13 minutes are exposed as
 `systemd_transition_exporter_recovery_uncovered_seconds`.
 
-One baseline sample per configured service is written at `15:00`, followed by
-the actual journal transitions in timestamp order. Periodic synthetic samples
-inside the recovered slot are not generated.
+The recovered slot is then **republished as samples**, not left to
+interpolation. Prometheus removes a series from instant queries once no sample
+is newer than its lookback delta (5 minutes by default), so an exporter outage
+longer than that would otherwise leave a hole even though the state is known.
+`remote_write.recovery_fill_interval` controls the density and must stay below
+the lookback delta; the default is `1m`.
+
+Each recovered slot therefore contains:
+
+- one sample per `recovery_fill_interval` tick carrying the effective state;
+- one sample at the exact timestamp of every recovered transition.
+
+Samples inside the slot may be older than data Prometheus already holds, for
+example when only the last minutes of the slot were missing. Keep
+`--storage.tsdb.out-of-order-time-window` at least as large as one slot so
+these are accepted.
 
 ## Host reboot
 
@@ -459,6 +473,14 @@ A boot ID change identifies a host reboot. The latest state and boot ID are
 persisted independently from transition events, so a service that was already
 UP before the exporter started can still be recognized after reboot. Services
 that were UP receive a synthetic DOWN event at the current host boot time.
+
+The kernel spells the boot ID with hyphens while the journal's `_BOOT_ID` field
+does not, so both are normalized before comparison. Without this, every restart
+following a journal recovery was misread as a reboot.
+
+If the boot predates the current recovery slot, the downtime is not
+republished: the slot rule forbids writing into a closed interval. The boot ID
+is adopted and the current state is re-established from the next snapshot.
 
 ## WAL
 

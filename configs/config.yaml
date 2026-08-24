@@ -35,9 +35,13 @@ remote_write:
   # 5-minute staleness interval; 1m is the recommended default.
   state_interval: 1m
 
+  # Republish the recovered slot at this interval so the series survives the
+  # Prometheus lookback delta (5m by default). Allowed range: 10s..4m.
+  recovery_fill_interval: 1m
+
   # Only the current local-time slot is recovered. For example, if the
-  # exporter becomes ready at 15:14, journal events are read from 15:00
-  # through 15:14 and earlier closed slots are deliberately left untouched.
+  # exporter becomes ready at 15:14, the slot 15:00..15:14 is read from the
+  # journal and refilled, while earlier closed slots are left untouched.
   recovery_window: 15m
 
   # Arbitrary constant labels added to every remote_write time series.

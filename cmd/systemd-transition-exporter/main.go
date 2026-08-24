@@ -81,6 +81,9 @@ func main() {
 		}
 	}
 
+	startupTo := time.Now()
+	slotStart := recovery.SlotStart(startupTo, cfg.RemoteWrite.RecoveryWindow)
+
 	currentBootID, err := systemd.BootID()
 	if err != nil {
 		_ = httpListener.Close()
@@ -98,6 +101,13 @@ func main() {
 		if e != nil {
 			_ = httpListener.Close()
 			log.Fatalf("read current boot time: %v", e)
+		}
+		// A reboot older than the slot lies in an already closed interval, so
+		// it must not be republished. The upcoming snapshot re-establishes the
+		// current state instead.
+		if bootTime.Before(slotStart) {
+			log.Printf("host reboot at %s precedes recovery slot %s; adopting boot id without republishing downtime", bootTime.Format(time.RFC3339), slotStart.Format(time.RFC3339))
+			eng.AdoptBootID(currentBootID)
 		}
 		for _, event := range eng.ApplyReboot(currentBootID, bootTime) {
 			if e := persist(event); e != nil {
@@ -119,7 +129,6 @@ func main() {
 		}
 	}
 
-	startupTo := time.Now()
 	startupObservedFrom := startupTo.Add(-cfg.Systemd.StartupRecoveryInterval)
 	if len(durableEvents) > 0 {
 		newest := durableEvents[0].EventTimeUnixMS
@@ -130,7 +139,7 @@ func main() {
 		}
 		startupObservedFrom = time.UnixMilli(newest)
 	}
-	var startupBaseline []model.StateSample
+	var startupFill []model.StateSample
 	var startupRecovered []model.Event
 	var startupSlotStart time.Time
 	if windowStart, windowEnd, ok := recovery.RecoveryWindow(startupTo, cfg.RemoteWrite.RecoveryWindow); ok {
@@ -161,12 +170,12 @@ func main() {
 					log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 				}
 			}
-			if baseline, e := recovery.BuildStateBaseline(ctx, cfg.Services, windowStart); e != nil {
-				log.Printf("startup recovery baseline failed: %v", e)
+			if fill, e := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval); e != nil {
+				log.Printf("startup recovery fill failed: %v", e)
 			} else {
-				startupBaseline = baseline
+				startupFill = fill
 			}
-			log.Printf("startup journal recovery completed: candidates=%d imported=%d", len(events), imported)
+			log.Printf("startup journal recovery completed: candidates=%d imported=%d fill_samples=%d", len(events), imported, len(startupFill))
 		}
 	}
 
@@ -214,8 +223,8 @@ func main() {
 					if e := rw.Send(ctx, events[:split]); e != nil && ctx.Err() == nil {
 						log.Printf("remote_write WAL recovery stopped: %v", e)
 					}
-					if e := rw.SendRecoveredStates(ctx, startupBaseline); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write startup baseline stopped: %v", e)
+					if e := rw.SendRecoveredStates(ctx, startupFill); e != nil && ctx.Err() == nil {
+						log.Printf("remote_write startup fill stopped: %v", e)
 					}
 					if e := rw.Send(ctx, events[split:]); e != nil && ctx.Err() == nil {
 						log.Printf("remote_write recovery stopped: %v", e)
@@ -224,8 +233,8 @@ func main() {
 					log.Printf("remote_write WAL scan: %v", e)
 				}
 			} else {
-				if e := rw.SendRecoveredStates(ctx, startupBaseline); e != nil && ctx.Err() == nil {
-					log.Printf("remote_write startup baseline stopped: %v", e)
+				if e := rw.SendRecoveredStates(ctx, startupFill); e != nil && ctx.Err() == nil {
+					log.Printf("remote_write startup fill stopped: %v", e)
 				}
 				if e := rw.Send(ctx, startupRecovered); e != nil && ctx.Err() == nil {
 					log.Printf("remote_write startup recovery stopped: %v", e)
@@ -383,18 +392,20 @@ func main() {
 		}
 
 		if rw != nil {
-			baseline, err := recovery.BuildStateBaseline(ctx, cfg.Services, windowStart)
+			fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
 			if err != nil {
 				return err
 			}
-			if err := rw.SendRecoveredStates(ctx, baseline); err != nil {
-				return err
+			// A rejected continuity sample must not discard the recovered
+			// transitions: the transitions are the authoritative history.
+			if err := rw.SendRecoveredStates(ctx, fill); err != nil {
+				log.Printf("recovery state fill failed: %v", err)
 			}
 			if err := rw.Send(ctx, recovered); err != nil {
 				return err
 			}
-			if len(baseline) > 0 {
-				log.Printf("recovery state baseline timestamp=%s samples=%d", windowStart.Format(time.RFC3339), len(baseline))
+			if len(fill) > 0 {
+				log.Printf("recovery state fill slot=%s..%s interval=%s samples=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), cfg.RemoteWrite.RecoveryFillInterval, len(fill))
 			}
 		}
 		log.Printf("journal recovery completed: slot=%s..%s candidates=%d imported=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), len(events), count)

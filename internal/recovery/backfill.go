@@ -12,6 +12,13 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
+// SlotStart returns the beginning of the local-time slot containing t. The grid
+// is anchored at each hour, so a 15m window yields HH:00, HH:15, HH:30, HH:45.
+func SlotStart(t time.Time, size time.Duration) time.Time {
+	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
+	return hour.Add(time.Duration(t.Minute()) * time.Minute / size * size)
+}
+
 // RecoveryWindow returns only the current local-time slot [slot start, ready).
 // The beginning of the observed outage is deliberately not used to widen the
 // journal query into already closed slots.
@@ -19,20 +26,41 @@ func RecoveryWindow(ready time.Time, size time.Duration) (time.Time, time.Time, 
 	if size <= 0 {
 		return time.Time{}, time.Time{}, false
 	}
-	local := ready
-	hour := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, local.Location())
-	start := hour.Add(time.Duration(local.Minute()) * time.Minute / size * size)
+	start := SlotStart(ready, size)
 	if !ready.After(start) {
 		return time.Time{}, time.Time{}, false
 	}
 	return start, ready, true
 }
 
-// BuildStateBaseline creates exactly one state sample per configured service
-// at the beginning of the recovered slot. The state is taken from the latest
-// journal transition strictly before the slot. A configured service with no
-// lifecycle history is treated as DOWN.
-func BuildStateBaseline(ctx context.Context, services []string, start time.Time) ([]model.StateSample, error) {
+// BuildStateFill reconstructs the state timeline of a recovered slot. Prometheus
+// drops a series from instant queries once no sample is newer than its lookback
+// delta, so an exporter outage must be republished as samples rather than left
+// to interpolation. Samples are emitted at every interval tick inside the slot
+// and at every recovered transition, so the slot is continuous while transitions
+// keep their exact timestamps.
+//
+// The state at the slot start comes from the latest journal transition strictly
+// before the slot. A configured service with no lifecycle history is DOWN.
+// Nothing before the slot start is ever generated: that interval is reported as
+// uncovered instead.
+func BuildStateFill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration) ([]model.StateSample, error) {
+	if interval <= 0 || !end.After(start) {
+		return nil, nil
+	}
+	byService := make(map[string][]model.Event)
+	for _, event := range events {
+		if event.EventTimeUnixMS < start.UnixMilli() || event.EventTimeUnixMS >= end.UnixMilli() {
+			continue
+		}
+		byService[event.Service] = append(byService[event.Service], event)
+	}
+	for service := range byService {
+		sort.SliceStable(byService[service], func(i, j int) bool {
+			return byService[service][i].EventTimeUnixMS < byService[service][j].EventTimeUnixMS
+		})
+	}
+
 	var out []model.StateSample
 	for _, service := range services {
 		state, ok, err := previousState(ctx, service, start)
@@ -45,7 +73,21 @@ func BuildStateBaseline(ctx context.Context, services []string, start time.Time)
 			// down until systemd reports a successful start.
 			state = model.StateDown
 		}
-		out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: start.UnixMilli()})
+
+		serviceEvents := byService[service]
+		eventIndex := 0
+		for ts := start; ts.Before(end); ts = ts.Add(interval) {
+			for eventIndex < len(serviceEvents) && serviceEvents[eventIndex].EventTimeUnixMS <= ts.UnixMilli() {
+				state = serviceEvents[eventIndex].State
+				out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: serviceEvents[eventIndex].EventTimeUnixMS})
+				eventIndex++
+			}
+			out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: ts.UnixMilli()})
+		}
+		for ; eventIndex < len(serviceEvents); eventIndex++ {
+			state = serviceEvents[eventIndex].State
+			out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: serviceEvents[eventIndex].EventTimeUnixMS})
+		}
 	}
 
 	sort.SliceStable(out, func(i, j int) bool {

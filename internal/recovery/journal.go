@@ -115,7 +115,7 @@ func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]mod
 			Service:            service,
 			State:              state,
 			EventTimeUnixMS:    us / 1000,
-			BootID:             r.BootID,
+			BootID:             model.CanonicalBootID(r.BootID),
 			Source:             model.SourceRecovery,
 			SystemdActiveState: state.String(),
 		})

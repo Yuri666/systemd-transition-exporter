@@ -31,16 +31,17 @@ type WALConfig struct {
 	Fsync     bool   `yaml:"fsync"`
 }
 type RemoteWriteConfig struct {
-	Enabled        bool              `yaml:"enabled"`
-	URL            string            `yaml:"url"`
-	BatchSize      int               `yaml:"batch_size"`
-	FlushInterval  time.Duration     `yaml:"flush_interval"`
-	RetryInterval  time.Duration     `yaml:"retry_interval"`
-	Timeout        time.Duration     `yaml:"timeout"`
-	Checkpoint     string            `yaml:"checkpoint"`
-	StateInterval  time.Duration     `yaml:"state_interval"`
-	RecoveryWindow time.Duration     `yaml:"recovery_window"`
-	Labels         map[string]string `yaml:"labels"`
+	Enabled              bool              `yaml:"enabled"`
+	URL                  string            `yaml:"url"`
+	BatchSize            int               `yaml:"batch_size"`
+	FlushInterval        time.Duration     `yaml:"flush_interval"`
+	RetryInterval        time.Duration     `yaml:"retry_interval"`
+	Timeout              time.Duration     `yaml:"timeout"`
+	Checkpoint           string            `yaml:"checkpoint"`
+	StateInterval        time.Duration     `yaml:"state_interval"`
+	RecoveryFillInterval time.Duration     `yaml:"recovery_fill_interval"`
+	RecoveryWindow       time.Duration     `yaml:"recovery_window"`
+	Labels               map[string]string `yaml:"labels"`
 }
 
 func Load(path string) (Config, error) {
@@ -89,8 +90,17 @@ func Load(path string) (Config, error) {
 		if c.RemoteWrite.StateInterval <= 0 {
 			c.RemoteWrite.StateInterval = time.Minute
 		}
+		if c.RemoteWrite.RecoveryFillInterval <= 0 {
+			c.RemoteWrite.RecoveryFillInterval = time.Minute
+		}
 		if c.RemoteWrite.RecoveryWindow <= 0 {
 			c.RemoteWrite.RecoveryWindow = 15 * time.Minute
+		}
+		// Prometheus drops a series from instant queries after its lookback
+		// delta, which defaults to 5 minutes. A recovered slot must therefore
+		// be republished more densely than that.
+		if c.RemoteWrite.RecoveryFillInterval < 10*time.Second || c.RemoteWrite.RecoveryFillInterval > 4*time.Minute {
+			return Config{}, fmt.Errorf("remote_write.recovery_fill_interval must be between 10s and 4m")
 		}
 		if c.RemoteWrite.RecoveryWindow < 5*time.Minute || c.RemoteWrite.RecoveryWindow > 60*time.Minute {
 			return Config{}, fmt.Errorf("remote_write.recovery_window must be between 5m and 60m")
