@@ -2,14 +2,7 @@
 
 Prometheus exporter for monitoring selected systemd services and recording **service state transitions** with systemd timestamps.
 
-The project is intended for availability/KPI calculations where current `ActiveState` alone is insufficient. The important data is the sequence and time of transitions such as:
-
-```text
-UP   -> DOWN @ 12:01:10
-DOWN -> UP   @ 12:01:12
-UP   -> DOWN @ 12:03:40
-DOWN -> UP   @ 12:04:00
-```
+The project is intended for availability/KPI calculations where current `ActiveState` alone is insufficient. The important data is the sequence and time of transitions.
 
 The exporter is intended for IMS infrastructure such as `pcscf.service`, `scscf.service`, and `icscf.service`, but is not limited to those units.
 
@@ -37,19 +30,7 @@ systemd ActiveState="active"  -> UP
 any other ActiveState           -> DOWN
 ```
 
-In particular, the following are **DOWN**, not UP:
-
-```text
-inactive
-activating
-deactivating
-failed
-reloading
-maintenance
-unknown
-```
-
-This rule is used consistently by the transition engine and the Prometheus current-state exporter. The collector does not treat a transitional state such as `activating` as service availability.
+In particular, `inactive`, `activating`, `deactivating`, `failed`, `reloading`, `maintenance`, and `unknown` are DOWN.
 
 ## Current implementation status
 
@@ -73,22 +54,14 @@ Implemented:
 - Configurable arbitrary static labels added to Remote Write series.
 - Periodic current-state Remote Write heartbeat.
 - Immediate current-state Remote Write after startup snapshot and D-Bus reconnect.
+- Crash/restart tests for WAL and Remote Write checkpoint handling.
 - systemd deployment unit.
-
-Still requiring production hardening:
-
-- reboot-gap reconciliation across old and new boots;
-- WAL checkpoints, segmentation and bounded retention for the collector event WAL;
-- full integration tests against a real systemd instance;
-- packaging and installation automation.
 
 ## Critical design rules
 
 ### D-Bus loss is not service downtime
 
 A D-Bus outage means that the collector temporarily cannot observe systemd. It does **not** prove that a monitored service stopped.
-
-Therefore:
 
 ```text
 systemd service state        -> service availability
@@ -99,11 +72,7 @@ The exporter keeps the last known service state while D-Bus is unavailable. When
 
 ### D-Bus timeout is not D-Bus disconnect
 
-A slow systemd operation must not cause a false D-Bus outage. The collector therefore does not use an application-level `Peer.Ping` timeout as the transport disconnect detector.
-
-The godbus connection context is used instead. `godbus` documents `Conn.Context()` as the context cancelled when the connection is closed and `Conn.Connected()` as the connection-state check.
-
-This distinction is important for service operations: starting/stopping a unit can temporarily make systemd slower without meaning that the D-Bus transport was lost.
+The collector does not use an application-level `Peer.Ping` timeout as the transport disconnect detector. The godbus connection context is used instead, avoiding false disconnects when systemd is temporarily busy during service operations.
 
 ## Architecture
 
@@ -116,9 +85,6 @@ This distinction is important for service operations: starting/stopping a unit c
                             |
                             v
                     internal/systemd
-                            |
-                            v
-                     state snapshots
                             |
                             v
                      internal/engine
@@ -157,76 +123,38 @@ D-Bus outage:
        engine -> WAL -> remote_write
 ```
 
-The collector event WAL is the durable boundary for events already accepted by the collector. The journal is the historical source used to fill a D-Bus observation gap. Remote Write provides delivery of the historical timeline to Prometheus.
+The collector event WAL is the durable boundary for events already accepted by the collector. The journal is the historical source used to fill a D-Bus observation gap.
 
 ## Repository layout
 
 ```text
-cmd/systemd-transition-exporter/
-    main.go                  CLI and application wiring
-
-internal/config/
-    config.go                YAML configuration
-
-internal/model/
-    model.go                 snapshots, states and events
-
-internal/systemd/
-    systemd.go               D-Bus/systemd access
-    resilient.go             connection lifecycle and reconnect
-
-internal/engine/
-    engine.go                transition detection, replay and recovery
-
-internal/wal/
-    wal.go                   durable JSONL event log
-
-internal/recovery/
-    journal.go               systemd journal recovery reader
-
-internal/metrics/
-    metrics.go               Prometheus exposition
-
-internal/remote_write/
-    remote_write.go          Prometheus Remote Write sender
-
-configs/
-    config.yaml              example configuration
-
-deploy/
-    systemd-transition-exporter.service
+cmd/systemd-transition-exporter/    CLI and application wiring
+internal/config/                    YAML configuration
+internal/model/                     snapshots, states and events
+internal/systemd/                   D-Bus/systemd access and reconnect
+internal/engine/                    transition detection and recovery
+internal/wal/                       durable JSONL event log
+internal/recovery/                  systemd journal recovery reader
+internal/metrics/                   Prometheus exposition
+internal/remote_write/              Prometheus Remote Write sender
+configs/config.yaml                 example configuration
+deploy/systemd-transition-exporter.service
 ```
 
 ## Building
 
-Package validation:
-
 ```bash
 go test ./...
 go build ./...
-```
-
-`go build ./...` validates/builds packages. To create the actual executable use:
-
-```bash
 mkdir -p bin
 go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 ```
 
-The repository Makefile provides:
-
-```bash
-make test
-make build
-make check
-make clean
-```
-
-`make check` runs tests and builds `bin/systemd-transition-exporter` explicitly.
+The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
 ## Configuration
 
-Example `configs/config.yaml`:
+Example:
 
 ```yaml
 server:
@@ -266,13 +194,9 @@ remote_write:
 
 `server.listen` is the HTTP listen address. `services` contains the systemd units to monitor. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect.
 
-`wal.enabled`, `wal.directory` and `wal.fsync` control the durable collector event log. The current WAL file is:
+`wal.enabled`, `wal.directory` and `wal.fsync` control the durable collector event log. The WAL file is `<wal.directory>/events.jsonl`.
 
-```text
-<wal.directory>/events.jsonl
-```
-
-### Remote Write
+## Remote Write
 
 Set `remote_write.enabled: true` to send service state samples to a Prometheus Remote Write receiver:
 
@@ -288,16 +212,27 @@ The destination Prometheus must have the Remote Write receiver enabled, for exam
 --enable-feature=remote-write-receiver
 ```
 
-The exporter sends transition samples using the **actual systemd transition timestamp**:
+### Metrics sent through Remote Write
+
+**The following metric is the historical service-availability metric delivered through Remote Write:**
 
 ```text
-systemd_service_state{service="cups.service",...} 0 <transition_timestamp_ms>
-systemd_service_state{service="cups.service",...} 1 <transition_timestamp_ms>
+systemd_service_state{service="cups.service",...} 0 <timestamp_ms>
+systemd_service_state{service="cups.service",...} 1 <timestamp_ms>
 ```
 
-These timestamps are not replaced by the time of the Remote Write request.
+Its semantics are:
 
-The sender retries failed delivery and maintains a checkpoint of the last successfully delivered transition sequence. The checkpoint does not advance for current-state heartbeat samples.
+- `1` = `ActiveState=active` exactly;
+- `0` = any other `ActiveState`;
+- transition samples use the **actual systemd transition timestamp**;
+- the timestamp is not replaced by the Remote Write request time;
+- every detected transition is delivered, including multiple transitions between Prometheus scrapes;
+- samples can contain arbitrary configured static labels in addition to `service`.
+
+The same `systemd_service_state` metric is also used for the current-state heartbeat. Heartbeat samples use the current exporter time and do not advance the transition checkpoint.
+
+The sender retries failed delivery and maintains a durable checkpoint of the last successfully delivered transition sequence. A successful HTTP `2xx` response advances the checkpoint; failed requests do not.
 
 ### Remote Write labels
 
@@ -312,34 +247,117 @@ remote_write:
     role: scscf
 ```
 
-The `service` label and metric name are controlled by the exporter and must not be overridden through this map.
+The `service` label and metric name are controlled by the exporter and cannot be overridden through this map.
 
 ### Current-state heartbeat
 
 `remote_write.state_interval` controls how often the exporter sends the current state of every monitored service. The default is one minute.
 
-A heartbeat is **not a transition**. It:
+A heartbeat:
 
+- is sent immediately after the initial systemd snapshot;
+- is sent immediately after a successful D-Bus reconnect/snapshot;
+- is then sent periodically according to `state_interval`;
 - does not increment transition counters;
 - does not receive a transition sequence number;
 - does not change the transition WAL/checkpoint;
-- uses the current timestamp when it is sent.
+- uses the current timestamp when sent.
 
-The first current-state sample is sent immediately after the initial systemd snapshot. The exporter does not wait for `state_interval` after startup. A new current-state sample is also sent immediately after a successful D-Bus reconnect/snapshot, followed by the normal heartbeat interval.
+This prevents a long-running service time series from disappearing because no new sample was received for an extended period.
 
-For example:
+## Prometheus metrics (`/metrics`)
+
+The `/metrics` endpoint intentionally exposes **exporter/transport diagnostics only**. Service state, transition counters and transition timestamps are not exposed through `/metrics`; they are delivered through Remote Write to avoid creating duplicate Prometheus series from scrape and Remote Write.
+
+### D-Bus metrics
 
 ```text
-19:00:00  exporter starts, service UP  -> state sample immediately
-19:01:00                              -> heartbeat UP
-19:02:00                              -> heartbeat UP
-19:03:17  service STOP                 -> transition DOWN, timestamp 19:03:17
-19:03:17+ state remains DOWN           -> transition sample already delivered
-19:04:00                              -> heartbeat DOWN
-19:05:00                              -> heartbeat DOWN
+# HELP systemd_transition_exporter_dbus_connected Whether the exporter is currently connected to the system D-Bus (1 connected, 0 disconnected).
+# TYPE systemd_transition_exporter_dbus_connected gauge
+systemd_transition_exporter_dbus_connected 1
 ```
 
-The heartbeat exists so that a long-running service remains represented in the Prometheus time series between transitions.
+**`systemd_transition_exporter_dbus_connected`** — current exporter connectivity to the system D-Bus. `1` means connected, `0` means disconnected.
+
+```text
+# HELP systemd_transition_exporter_dbus_disconnects_total Total number of system D-Bus disconnections observed by the exporter.
+# TYPE systemd_transition_exporter_dbus_disconnects_total counter
+systemd_transition_exporter_dbus_disconnects_total 0
+```
+
+**`systemd_transition_exporter_dbus_disconnects_total`** — total number of real D-Bus disconnections observed since exporter start.
+
+```text
+# HELP systemd_transition_exporter_dbus_last_change_timestamp_seconds Unix timestamp of the last system D-Bus connection state change.
+# TYPE systemd_transition_exporter_dbus_last_change_timestamp_seconds gauge
+systemd_transition_exporter_dbus_last_change_timestamp_seconds 1787550000
+```
+
+**`systemd_transition_exporter_dbus_last_change_timestamp_seconds`** — Unix timestamp, in seconds, of the most recent D-Bus connected/disconnected state change.
+
+```text
+# HELP systemd_transition_exporter_dbus_disconnected_seconds Duration in seconds of the current system D-Bus disconnection, or 0 when connected.
+# TYPE systemd_transition_exporter_dbus_disconnected_seconds gauge
+systemd_transition_exporter_dbus_disconnected_seconds 0
+```
+
+**`systemd_transition_exporter_dbus_disconnected_seconds`** — duration of the current D-Bus outage in seconds. `0` while connected.
+
+### Remote Write delivery metrics
+
+These metrics are **only exporter diagnostics exposed by `/metrics`**. They are not the service-state time series sent through Remote Write.
+
+```text
+# HELP systemd_transition_exporter_remote_write_successful_requests_total Total number of successful Remote Write HTTP requests.
+# TYPE systemd_transition_exporter_remote_write_successful_requests_total counter
+systemd_transition_exporter_remote_write_successful_requests_total 10
+```
+
+**`systemd_transition_exporter_remote_write_successful_requests_total`** — number of Remote Write HTTP requests completed with a `2xx` response.
+
+```text
+# HELP systemd_transition_exporter_remote_write_failed_requests_total Total number of failed Remote Write HTTP requests or rejected requests.
+# TYPE systemd_transition_exporter_remote_write_failed_requests_total counter
+systemd_transition_exporter_remote_write_failed_requests_total 2
+```
+
+**`systemd_transition_exporter_remote_write_failed_requests_total`** — number of failed, rejected, or otherwise unsuccessful Remote Write attempts. This can include attempts that are subsequently retried.
+
+```text
+# HELP systemd_transition_exporter_remote_write_retries_total Total number of Remote Write retry attempts.
+# TYPE systemd_transition_exporter_remote_write_retries_total counter
+systemd_transition_exporter_remote_write_retries_total 2
+```
+
+**`systemd_transition_exporter_remote_write_retries_total`** — number of retry attempts made after a failed Remote Write request.
+
+```text
+# HELP systemd_transition_exporter_remote_write_samples_sent_total Total number of samples accepted by the Remote Write endpoint in successful requests.
+# TYPE systemd_transition_exporter_remote_write_samples_sent_total counter
+systemd_transition_exporter_remote_write_samples_sent_total 123
+```
+
+**`systemd_transition_exporter_remote_write_samples_sent_total`** — total number of samples contained in successfully accepted Remote Write requests. It counts samples, not unique transitions.
+
+### Important distinction
+
+The complete metric set is therefore:
+
+| Metric | `/metrics` scrape | Remote Write | Purpose |
+|---|---:|---:|---|
+| `systemd_service_state` | **No** | **Yes** | Service availability and historical transitions |
+| `systemd_service_transitions_total` | **No** | No | Internal transition counter used by the exporter implementation/history |
+| `systemd_service_last_transition_timestamp_seconds` | **No** | No | Internal last-transition timestamp |
+| `systemd_transition_exporter_dbus_connected` | **Yes** | No | D-Bus connectivity |
+| `systemd_transition_exporter_dbus_disconnects_total` | **Yes** | No | D-Bus disconnect counter |
+| `systemd_transition_exporter_dbus_last_change_timestamp_seconds` | **Yes** | No | Last D-Bus state-change timestamp |
+| `systemd_transition_exporter_dbus_disconnected_seconds` | **Yes** | No | Current D-Bus outage duration |
+| `systemd_transition_exporter_remote_write_successful_requests_total` | **Yes** | No | Successful Remote Write requests |
+| `systemd_transition_exporter_remote_write_failed_requests_total` | **Yes** | No | Failed Remote Write requests |
+| `systemd_transition_exporter_remote_write_retries_total` | **Yes** | No | Remote Write retries |
+| `systemd_transition_exporter_remote_write_samples_sent_total` | **Yes** | No | Samples accepted by Remote Write |
+
+> **Note:** `systemd_service_transitions_total` and `systemd_service_last_transition_timestamp_seconds` are part of the historical service metric model/WAL state but are deliberately not emitted by the current `/metrics` handler. The authoritative service-state timeline delivered to Prometheus is `systemd_service_state` through Remote Write.
 
 ## Running manually
 
@@ -348,51 +366,18 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 ./bin/systemd-transition-exporter --config ./configs/config.yaml
 ```
 
-The metrics endpoint is:
+Metrics endpoint:
 
 ```text
 http://127.0.0.1:9877/metrics
 ```
 
-## Prometheus metrics
-
-Current service state:
+Health endpoints:
 
 ```text
-systemd_service_state{service="pcscf.service"} 1
+/health
+/ready
 ```
-
-`1` means **exactly `ActiveState=active`** and `0` means every other systemd `ActiveState`.
-
-Transition counters:
-
-```text
-systemd_service_transitions_total{service="pcscf.service",state="up"} ...
-systemd_service_transitions_total{service="pcscf.service",state="down"} ...
-```
-
-Last transition timestamp:
-
-```text
-systemd_service_last_transition_timestamp_seconds{service="pcscf.service"} ...
-```
-
-D-Bus connectivity:
-
-```text
-systemd_transition_exporter_dbus_connected 1
-systemd_transition_exporter_dbus_disconnects_total 0
-systemd_transition_exporter_dbus_last_change_timestamp_seconds ...
-systemd_transition_exporter_dbus_disconnected_seconds 0
-```
-
-During a real D-Bus outage:
-
-```text
-systemd_transition_exporter_dbus_connected 0
-```
-
-The service state is intentionally not changed merely because D-Bus is unavailable.
 
 ## D-Bus monitoring and reconnect
 
@@ -427,7 +412,7 @@ CONNECTED
                            journal recovery
 ```
 
-There is deliberately **no `Peer.Ping` timeout in this state machine**. This prevents the false disconnect observed when a service start/stop temporarily made systemd busy.
+There is deliberately no `Peer.Ping` timeout in this state machine. A slow systemd operation must not be interpreted as a D-Bus outage.
 
 ## Transition timestamps
 
@@ -438,13 +423,13 @@ The exporter uses:
 - `ActiveEnterTimestampMonotonic`;
 - `ActiveExitTimestampMonotonic`.
 
-Wall-clock transition timestamps are stored in microseconds internally and exported in seconds where Prometheus requires seconds.
+Wall-clock transition timestamps are stored in microseconds internally and exported in milliseconds for Remote Write samples and seconds where Prometheus metric names require seconds.
 
 ## Multiple transitions between observations
 
-The engine compares the previous and current systemd enter/exit timestamps and emits newly observed transitions in timestamp order, allowing multiple transitions to be detected between observations.
+The engine compares previous and current systemd enter/exit timestamps and emits newly observed transitions in timestamp order, allowing multiple transitions to be detected between observations.
 
-Systemd unit properties are not a complete historical event log. Therefore arbitrary transitions during a D-Bus monitoring gap are recovered from journald.
+Systemd unit properties are not a complete historical event log. Therefore transitions during a D-Bus monitoring gap are recovered from journald.
 
 ## Host reboot
 
@@ -458,7 +443,7 @@ A boot ID change identifies a host reboot. Reboot is explicitly treated as downt
 
 ## WAL
 
-The current collector WAL is append-only JSON Lines:
+The collector WAL is append-only JSON Lines:
 
 ```text
 /var/lib/systemd-transition-exporter/wal/events.jsonl
@@ -467,6 +452,8 @@ The current collector WAL is append-only JSON Lines:
 Each record contains the event sequence, service, state, wall-clock timestamp, monotonic timestamp, boot ID, source and systemd state information.
 
 The WAL provides durable storage of events already detected by the collector and replay on startup. Remote Write has a separate delivery checkpoint. Heartbeat samples do not advance the transition checkpoint.
+
+Remote Write is deliberately **at-least-once**. The checkpoint advances only after the receiver returns `2xx` and the checkpoint file has been durably persisted. A crash in the narrow interval after receiver acceptance but before checkpoint persistence can cause a sample to be sent again after restart.
 
 ## Debug endpoint
 
@@ -483,9 +470,7 @@ force a disconnect of the exporter's current D-Bus connection with:
 curl -X POST http://127.0.0.1:9877/debug/dbus/disconnect
 ```
 
-The endpoint disconnects only the exporter's D-Bus connection. It does not stop the system D-Bus daemon or systemd.
-
-Do not enable the debug endpoint on an externally accessible production listener.
+The endpoint disconnects only the exporter's D-Bus connection. It does not stop system D-Bus or systemd. Do not enable it on an externally accessible production listener.
 
 ## systemd installation
 
@@ -495,19 +480,9 @@ The deployment unit is:
 deploy/systemd-transition-exporter.service
 ```
 
-It expects the binary at:
+It expects the binary at `/usr/local/bin/systemd-transition-exporter` and configuration at `/etc/systemd-transition-exporter/config.yaml`.
 
-```text
-/usr/local/bin/systemd-transition-exporter
-```
-
-and configuration at:
-
-```text
-/etc/systemd-transition-exporter/config.yaml
-```
-
-A typical installation sequence is:
+Typical installation:
 
 ```bash
 sudo install -d /etc/systemd-transition-exporter
@@ -515,26 +490,13 @@ sudo install -d /var/lib/systemd-transition-exporter/wal
 sudo install -m 0755 bin/systemd-transition-exporter /usr/local/bin/systemd-transition-exporter
 sudo install -m 0644 configs/config.yaml /etc/systemd-transition-exporter/config.yaml
 sudo install -m 0644 deploy/systemd-transition-exporter.service /etc/systemd/system/systemd-transition-exporter.service
-```
-
-Create the service account before starting the unit:
-
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin systemd-transition-exporter
-sudo chown -R systemd-transition-exporter:systemd-transition-exporter /var/lib/systemd-transition-exporter
-```
-
-Then:
-
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now systemd-transition-exporter
-sudo systemctl status systemd-transition-exporter
 ```
 
 ## Prometheus scrape configuration
 
-The `/metrics` endpoint remains available for exporter health, current state and diagnostic counters:
+The `/metrics` endpoint is intended for exporter health and transport/delivery diagnostics:
 
 ```yaml
 scrape_configs:
@@ -545,26 +507,27 @@ scrape_configs:
           - "127.0.0.1:9877"
 ```
 
-Historical transition samples are delivered independently through Remote Write. Prometheus scrape interval therefore does not determine transition detection precision.
+Historical service transitions are delivered independently through Remote Write. The Prometheus scrape interval therefore does not determine transition detection precision.
 
-## Development workflow
+## Testing
 
-Before committing changes:
+Run all unit tests:
 
 ```bash
-make check
+go test ./...
 ```
 
-For a clean rebuild:
+The test suite includes Remote Write delivery, retry/failure handling, durable checkpoint behavior and crash/restart scenarios.
+
+For a clean validation:
 
 ```bash
-make clean
 make check
 ```
 
 ## Roadmap
 
-### Phase 1/2 — foundation
+### Foundation
 
 - project structure;
 - configuration;
@@ -574,14 +537,14 @@ make check
 - durable event WAL;
 - build/deployment skeleton.
 
-### Phase 3 — resilient observation
+### Resilient observation
 
 - D-Bus reconnect;
 - explicit D-Bus connectivity metrics;
 - reconciliation after reconnect;
 - host reboot detection.
 
-### Phase 4 — gap recovery
+### Gap recovery
 
 - journald reader;
 - identify systemd unit start/stop events;
@@ -589,19 +552,18 @@ make check
 - deduplicate D-Bus and journal events;
 - preserve exact event timestamps and ordering.
 
-### Phase 5 — durable delivery
+### Durable delivery
 
 - WAL replay;
-- checkpoints;
-- WAL rotation/retention;
-- Remote Write delivery;
+- durable Remote Write checkpoints;
+- Remote Write retries;
 - recovery after collector crash;
 - current-state heartbeat and startup/reconnect state publication.
 
-### Phase 6 — production hardening
+### Production hardening
 
-- integration tests against systemd;
+- reboot-gap reconciliation across old and new boots;
+- WAL rotation/retention;
+- integration tests against a real systemd instance;
 - load tests with large unit sets;
-- bounded memory usage;
-- security review of D-Bus permissions and systemd sandboxing;
-- packaging.
+- packaging and installation automation.
