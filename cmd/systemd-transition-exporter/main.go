@@ -246,14 +246,10 @@ func main() {
 			stateTimer := time.NewTicker(cfg.RemoteWrite.StateInterval)
 			defer timer.Stop()
 			defer stateTimer.Stop()
-			flush := func() {
-				if len(batch) == 0 {
-					return
-				}
-				if e := rw.Send(ctx, batch); e != nil && ctx.Err() == nil {
-					log.Printf("remote_write send failed: %v", e)
-				} else {
-					batch = batch[:0]
+			var degradedSince time.Time
+			markDegraded := func() {
+				if degradedSince.IsZero() {
+					degradedSince = time.Now()
 				}
 			}
 			drainEvents := func() {
@@ -266,46 +262,111 @@ func main() {
 					}
 				}
 			}
-			sendQueuedStates := func() {
-				for {
-					select {
-					case state := <-stateQueue:
-						if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil {
-							log.Printf("remote_write startup state failed for %s: %v", state.Service, e)
-						}
-					default:
-						return
-					}
+			// flush reports whether the transition backlog is empty afterwards.
+			// Current-state samples must not be published while it is not:
+			// a sample stamped now would make the pending history out of order.
+			flush := func() bool {
+				drainEvents()
+				if len(batch) == 0 {
+					return true
+				}
+				err := rw.Send(ctx, batch)
+				if err == nil {
+					batch = batch[:0]
+					return true
+				}
+				if ctx.Err() != nil {
+					return false
+				}
+				markDegraded()
+				if remote_write.IsPermanent(err) {
+					// Retrying a rejected payload forever would block every
+					// later transition. The events stay durable in the WAL.
+					log.Printf("remote_write rejected %d transition events; dropping them from the send queue: %v", len(batch), err)
+					reg.AddDroppedEvents(len(batch))
+					batch = batch[:0]
+					return true
+				}
+				log.Printf("remote_write send failed: %v", err)
+				return false
+			}
+			// republishSlot restores continuity after a delivery outage. The
+			// receiver missed both transitions and heartbeats, so the current
+			// slot is rebuilt from the journal exactly as on startup.
+			republishSlot := func() bool {
+				windowStart, windowEnd, ok := recovery.RecoveryWindow(time.Now(), cfg.RemoteWrite.RecoveryWindow)
+				if !ok {
+					return true
+				}
+				events, err := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd)
+				if err != nil {
+					log.Printf("remote_write recovery republish: journal read failed: %v", err)
+					return false
+				}
+				fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
+				if err != nil {
+					log.Printf("remote_write recovery republish: state fill failed: %v", err)
+					return false
+				}
+				if err := rw.SendRecoveredStates(ctx, fill); err != nil {
+					log.Printf("remote_write recovery republish: send failed: %v", err)
+					return false
+				}
+				log.Printf("remote_write delivery recovered: republished slot=%s..%s transitions=%d samples=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), len(events), len(fill))
+				return true
+			}
+			sendCurrentStates := func(states []model.ServiceState) {
+				if len(states) == 0 {
+					return
+				}
+				if e := rw.SendCurrentStates(ctx, states); e != nil && ctx.Err() == nil {
+					markDegraded()
+					log.Printf("remote_write current state failed: %v", e)
 				}
 			}
 
 			for {
+				// Disabled while a backlog exists so that history is always
+				// delivered before anything stamped with the current time.
+				var readyStates <-chan model.ServiceState
+				if len(batch) == 0 {
+					readyStates = stateQueue
+				}
 				select {
 				case e := <-eventQueue:
 					batch = append(batch, e)
 					if len(batch) >= cfg.RemoteWrite.BatchSize {
 						flush()
 					}
-				case state := <-stateQueue:
-					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write startup state failed for %s: %v", state.Service, e)
+				case state := <-readyStates:
+					if !flush() {
+						select {
+						case stateQueue <- state:
+						default:
+						}
+						continue
 					}
+					sendCurrentStates([]model.ServiceState{state})
 				case <-timer.C:
-					drainEvents()
 					flush()
 				case <-stateTimer.C:
-					drainEvents()
-					flush()
-					sendQueuedStates()
+					if !flush() {
+						continue
+					}
+					if !degradedSince.IsZero() {
+						// A shorter outage cannot have produced a gap, because
+						// no heartbeat was missed while it lasted.
+						if time.Since(degradedSince) < cfg.RemoteWrite.StateInterval || republishSlot() {
+							degradedSince = time.Time{}
+						}
+					}
 					states := make([]model.ServiceState, 0, len(cfg.Services))
 					for _, service := range cfg.Services {
 						if st, ok := eng.State(service); ok {
 							states = append(states, st)
 						}
 					}
-					if e := rw.SendCurrentStates(ctx, states); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write state heartbeat failed: %v", e)
-					}
+					sendCurrentStates(states)
 				case <-ctx.Done():
 					drainEvents()
 					flush()

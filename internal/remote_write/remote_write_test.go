@@ -112,6 +112,26 @@ func TestRecoveredStateSamplesPreserveTimestamps(t *testing.T) {
 	if got := s.LastSent(); got != 0 { t.Fatalf("LastSent = %d, want 0", got) }
 }
 
+func TestSendGivesUpAfterBoundedRetriesWhileReceiverIsDown(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer server.Close()
+	s := testSender(t, server.URL, filepath.Join(t.TempDir(), "checkpoint.json"))
+	err := s.Send(context.Background(), []model.Event{event(1, "cups.service", model.StateDown, 1000)})
+	if err == nil { t.Fatal("Send unexpectedly succeeded") }
+	if IsPermanent(err) { t.Fatalf("error must stay retryable so the caller keeps the batch: %v", err) }
+	if got := requests.Load(); got != maxAttempts { t.Fatalf("requests = %d, want %d", got, maxAttempts) }
+	if got := s.LastSent(); got != 0 { t.Fatalf("LastSent = %d, want 0", got) }
+}
+
+func TestRejectedRequestIsReportedAsPermanent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadRequest) }))
+	defer server.Close()
+	s := testSender(t, server.URL, filepath.Join(t.TempDir(), "checkpoint.json"))
+	err := s.Send(context.Background(), []model.Event{event(1, "cups.service", model.StateDown, 1000)})
+	if !IsPermanent(err) { t.Fatalf("error = %v, want permanent rejection", err) }
+}
+
 func TestRemoteWritePreservesEventTimestamp(t *testing.T) {
 	const eventTimestamp = int64(1787436204558)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { wr := decodeWriteRequest(t, r); if len(wr.Timeseries) != 1 || len(wr.Timeseries[0].Samples) != 1 { t.Fatalf("unexpected write request: %+v", wr) }; if got := wr.Timeseries[0].Samples[0].Timestamp; got != eventTimestamp { t.Fatalf("timestamp = %d, want %d", got, eventTimestamp) }; w.WriteHeader(http.StatusOK) }))

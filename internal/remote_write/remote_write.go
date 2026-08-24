@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,27 @@ type Stats struct {
 	FailedRequests     uint64
 	Retries            uint64
 	SentSamples        uint64
+}
+
+// maxAttempts bounds a single delivery attempt so the sender cannot block the
+// caller for the whole duration of a receiver outage. The caller keeps the
+// batch and retries, which lets it continue collecting and ordering events.
+const maxAttempts = 3
+
+// PermanentError reports a receiver rejection that retrying cannot fix, such as
+// a sample refused as out of order. Retrying it forever would block every later
+// transition behind it.
+type PermanentError struct {
+	StatusCode int
+}
+
+func (e *PermanentError) Error() string {
+	return fmt.Sprintf("remote_write rejected request: HTTP %d", e.StatusCode)
+}
+
+func IsPermanent(err error) bool {
+	var permanent *PermanentError
+	return errors.As(err, &permanent)
 }
 
 type Sender struct {
@@ -252,7 +274,8 @@ func (s *Sender) sendSeries(ctx context.Context, series map[string]*prompb.TimeS
 	}
 	payload = snappy.Encode(nil, payload)
 
-	for {
+	var lastErr error
+	for attempt := 1; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.URL, bytes.NewReader(payload))
 		if err != nil {
 			return err
@@ -272,11 +295,17 @@ func (s *Sender) sendSeries(ctx context.Context, series map[string]*prompb.TimeS
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 				s.failedRequests.Add(1)
-				return fmt.Errorf("remote_write rejected request: HTTP %d", resp.StatusCode)
+				return &PermanentError{StatusCode: resp.StatusCode}
 			}
+			lastErr = fmt.Errorf("remote_write receiver returned HTTP %d", resp.StatusCode)
+		} else {
+			lastErr = err
 		}
 
 		s.failedRequests.Add(1)
+		if attempt >= maxAttempts {
+			return lastErr
+		}
 		s.retries.Add(1)
 		t := time.NewTimer(s.cfg.RetryInterval)
 		select {

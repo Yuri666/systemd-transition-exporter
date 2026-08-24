@@ -266,6 +266,32 @@ A heartbeat:
 
 This prevents a long-running service time series from disappearing because no new sample was received for an extended period.
 
+A heartbeat is suppressed while undelivered transitions are still queued. A
+sample stamped with the current time would raise the maximum timestamp of the
+series, and the pending transitions behind it — which are older by definition —
+would then be refused as out of order. History is therefore always delivered
+first, and the present state only afterwards.
+
+## Remote Write outage
+
+A destination outage is handled like a collector outage, because the receiver
+missed both transitions and heartbeats:
+
+- transitions accumulate in the durable WAL and in the send queue, and no
+  current-time sample is published while they are pending;
+- a single delivery attempt is bounded, so the sender never blocks the queue for
+  the whole duration of the outage; the batch is retained and retried;
+- when delivery succeeds again, the exporter republishes the current recovery
+  slot from the journal exactly as it does on startup, which restores the
+  continuity of every monitored service — including services that stayed down
+  and would otherwise leave a gap in the graph;
+- a request rejected with HTTP `4xx` is dropped from the send queue instead of
+  being retried forever, because an unchanged payload would be rejected again
+  and would block every later transition. The events remain in the WAL and
+  `systemd_transition_exporter_remote_write_dropped_events_total` is increased.
+  A growing counter almost always means
+  `--storage.tsdb.out-of-order-time-window` is smaller than one recovery slot.
+
 ## Prometheus metrics (`/metrics`)
 
 The `/metrics` endpoint intentionally exposes **exporter/transport diagnostics only**. Service state, transition counters and transition timestamps are not exposed through `/metrics`; they are delivered through Remote Write to avoid creating duplicate Prometheus series from scrape and Remote Write.
@@ -340,6 +366,14 @@ systemd_transition_exporter_remote_write_samples_sent_total 123
 
 **`systemd_transition_exporter_remote_write_samples_sent_total`** — total number of samples contained in successfully accepted Remote Write requests. It counts samples, not unique transitions.
 
+```text
+# HELP systemd_transition_exporter_remote_write_dropped_events_total Total number of transition events dropped after a permanent Remote Write rejection.
+# TYPE systemd_transition_exporter_remote_write_dropped_events_total counter
+systemd_transition_exporter_remote_write_dropped_events_total 0
+```
+
+**`systemd_transition_exporter_remote_write_dropped_events_total`** — transition events removed from the send queue after the receiver rejected them with HTTP `4xx`. They stay in the WAL. Any non-zero value means transition history did not reach Prometheus, usually because the out-of-order window is too small.
+
 ### Important distinction
 
 The complete metric set is therefore:
@@ -357,6 +391,7 @@ The complete metric set is therefore:
 | `systemd_transition_exporter_remote_write_failed_requests_total` | **Yes** | No | Failed Remote Write requests |
 | `systemd_transition_exporter_remote_write_retries_total` | **Yes** | No | Remote Write retries |
 | `systemd_transition_exporter_remote_write_samples_sent_total` | **Yes** | No | Samples accepted by Remote Write |
+| `systemd_transition_exporter_remote_write_dropped_events_total` | **Yes** | No | Transitions dropped after a permanent rejection |
 | `systemd_transition_exporter_recovery_attempts_total` | **Yes** | No | Aligned recovery slots attempted |
 | `systemd_transition_exporter_recovery_slot_start_timestamp_seconds` | **Yes** | No | Start of the last recovered slot |
 | `systemd_transition_exporter_recovery_slot_end_timestamp_seconds` | **Yes** | No | End of the last journal query |
