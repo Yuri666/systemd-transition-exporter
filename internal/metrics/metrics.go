@@ -99,31 +99,10 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	defer r.mu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 
-	// Prometheus exposition format requires HELP/TYPE metadata to describe a
-	// metric family. Keep each metadata block immediately before that family's
-	// samples instead of grouping metadata for several families together.
-	fmt.Fprintln(w, "# HELP systemd_service_state Current availability state of the systemd service (1 for active, 0 otherwise).")
-	fmt.Fprintln(w, "# TYPE systemd_service_state gauge")
-	for service, state := range r.states {
-		v := 0
-		if state == model.StateUp {
-			v = 1
-		}
-		fmt.Fprintf(w, "systemd_service_state{service=%q} %d\n", service, v)
-	}
-
-	fmt.Fprintln(w, "# HELP systemd_service_transitions_total Total number of observed systemd service state transitions, partitioned by resulting state.")
-	fmt.Fprintln(w, "# TYPE systemd_service_transitions_total counter")
-	for service := range r.states {
-		fmt.Fprintf(w, "systemd_service_transitions_total{service=%q,state=\"up\"} %d\n", service, r.up[service])
-		fmt.Fprintf(w, "systemd_service_transitions_total{service=%q,state=\"down\"} %d\n", service, r.down[service])
-	}
-
-	fmt.Fprintln(w, "# HELP systemd_service_last_transition_timestamp_seconds Unix timestamp of the last observed systemd service state transition.")
-	fmt.Fprintln(w, "# TYPE systemd_service_last_transition_timestamp_seconds gauge")
-	for service := range r.states {
-		fmt.Fprintf(w, "systemd_service_last_transition_timestamp_seconds{service=%q} %g\n", service, float64(r.last[service])/1000)
-	}
+	// Service state, transition counters and transition timestamps are
+	// delivered exclusively through Remote Write. They are intentionally not
+	// exposed here because scraping the same series would create duplicate
+	// time-series sources in Prometheus with conflicting timestamps.
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_connected Whether the exporter is currently connected to the system D-Bus (1 connected, 0 disconnected).")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_connected gauge")
