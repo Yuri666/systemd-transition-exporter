@@ -145,6 +145,34 @@ func (s *Sender) sendEventsLocked(ctx context.Context, events []model.Event) err
 	return nil
 }
 
+// SendRecoveredStates sends historical state samples generated for a recovered
+// interval. These samples deliberately do not advance the transition
+// checkpoint because they are synthetic continuity samples rather than
+// observed transitions. The caller serializes this call with transition
+// delivery so samples for a series remain timestamp ordered.
+func (s *Sender) SendRecoveredStates(ctx context.Context, samples []model.StateSample) error {
+	if s == nil || len(samples) == 0 {
+		return nil
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
+	series := make(map[string]*prompb.TimeSeries)
+	for _, sample := range samples {
+		ts := series[sample.Service]
+		if ts == nil {
+			ts = &prompb.TimeSeries{Labels: s.labels(sample.Service)}
+			series[sample.Service] = ts
+		}
+		value := float64(0)
+		if sample.State == model.StateUp {
+			value = 1
+		}
+		ts.Samples = append(ts.Samples, prompb.Sample{Value: value, Timestamp: sample.TimestampUnixMS})
+	}
+	return s.sendSeries(ctx, series)
+}
+
 // SendCurrentStates writes heartbeat samples using the current timestamp. It
 // never advances the transition checkpoint: a heartbeat is not a transition.
 func (s *Sender) SendCurrentStates(ctx context.Context, states []model.ServiceState) error {
@@ -175,8 +203,6 @@ func (s *Sender) labels(service string) []prompb.Label {
 		{Name: "service", Value: service},
 	}
 	for n, v := range s.cfg.Labels {
-		// The exporter owns these labels. Do not allow configuration to create
-		// conflicting metric-name/service labels.
 		if n == "__name__" || n == "service" {
 			continue
 		}
@@ -281,13 +307,6 @@ func (s *Sender) loadCheckpoint() error {
 // sequence is advanced only after the corresponding Remote Write request has
 // returned a successful 2xx response. The temporary file is synced before the
 // atomic rename and the containing directory is synced afterwards.
-//
-// This closes the ordinary filesystem crash window around checkpoint writes.
-// A crash after the receiver has accepted a request but before this checkpoint
-// is persisted can still cause the same samples to be sent again after restart;
-// Remote Write has no transaction/idempotency primitive that lets the sender
-// eliminate that final ambiguity. Therefore delivery is deliberately
-// at-least-once, with the original sequence/timestamp preserved.
 func (s *Sender) saveCheckpoint(seq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
