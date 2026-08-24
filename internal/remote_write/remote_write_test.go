@@ -17,7 +17,7 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
-func testSender(t *testing.T, serverURL, checkpoint string) *Sender {
+func testSender(t *testing.T, serverURL, checkpointPath string) *Sender {
 	t.Helper()
 	s, err := New(Config{
 		Enabled:       true,
@@ -25,7 +25,7 @@ func testSender(t *testing.T, serverURL, checkpoint string) *Sender {
 		BatchSize:     2,
 		RetryInterval: time.Millisecond,
 		Timeout:       time.Second,
-		Checkpoint:    checkpoint,
+		Checkpoint:    checkpointPath,
 		Labels:        map[string]string{"site": "test"},
 	})
 	if err != nil {
@@ -53,11 +53,11 @@ func decodeWriteRequest(t *testing.T, r *http.Request) *prompb.WriteRequest {
 
 func event(seq uint64, service string, state model.AvailabilityState, ts int64) model.Event {
 	return model.Event{
-		Sequence:         seq,
-		Service:          service,
-		State:            state,
-		EventTimeUnixMS:  ts,
-		Source:           model.SourceSystemd,
+		Sequence:        seq,
+		Service:         service,
+		State:           state,
+		EventTimeUnixMS: ts,
+		Source:          model.SourceSystemd,
 	}
 }
 
@@ -73,8 +73,8 @@ func TestSendRetriesAfterServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
-	s := testSender(t, server.URL, checkpoint)
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	s := testSender(t, server.URL, checkpointPath)
 	if err := s.Send(context.Background(), []model.Event{event(1, "cups.service", model.StateDown, 1000)}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -97,8 +97,8 @@ func TestSendDoesNotRetryClientError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
-	s := testSender(t, server.URL, checkpoint)
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	s := testSender(t, server.URL, checkpointPath)
 	if err := s.Send(context.Background(), []model.Event{event(1, "cups.service", model.StateDown, 1000)}); err == nil {
 		t.Fatal("Send unexpectedly succeeded")
 	}
@@ -121,8 +121,8 @@ func TestCheckpointPersistsAfterSuccessfulBatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
-	s := testSender(t, server.URL, checkpoint)
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	s := testSender(t, server.URL, checkpointPath)
 	events := []model.Event{
 		event(1, "cups.service", model.StateDown, 1000),
 		event(2, "cups.service", model.StateUp, 2000),
@@ -134,7 +134,7 @@ func TestCheckpointPersistsAfterSuccessfulBatch(t *testing.T) {
 		t.Fatalf("samples = %d, want 2", got)
 	}
 
-	data, err := os.ReadFile(checkpoint)
+	data, err := os.ReadFile(checkpointPath)
 	if err != nil {
 		t.Fatalf("read checkpoint: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestCheckpointPersistsAfterSuccessfulBatch(t *testing.T) {
 		t.Fatalf("checkpoint sequence = %d, want 2", c.LastSequence)
 	}
 
-	restarted := testSender(t, server.URL, checkpoint)
+	restarted := testSender(t, server.URL, checkpointPath)
 	if got := restarted.LastSent(); got != 2 {
 		t.Fatalf("restarted LastSent = %d, want 2", got)
 	}
@@ -154,22 +154,21 @@ func TestCheckpointPersistsAfterSuccessfulBatch(t *testing.T) {
 
 func TestRestartResumesFromCheckpointWithoutResendingDeliveredEvents(t *testing.T) {
 	var requests atomic.Int32
-	var received []uint64
+	var received []int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		wr := decodeWriteRequest(t, r)
 		for _, ts := range wr.Timeseries {
-			for range ts.Samples {
-				received = append(received, uint64(ts.Samples[0].Timestamp))
-				break
+			for _, sample := range ts.Samples {
+				received = append(received, sample.Timestamp)
 			}
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
-	first := testSender(t, server.URL, checkpoint)
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	first := testSender(t, server.URL, checkpointPath)
 	if err := first.Send(context.Background(), []model.Event{
 		event(1, "cups.service", model.StateDown, 1000),
 		event(2, "cups.service", model.StateUp, 2000),
@@ -177,7 +176,7 @@ func TestRestartResumesFromCheckpointWithoutResendingDeliveredEvents(t *testing.
 		t.Fatalf("first Send: %v", err)
 	}
 
-	second := testSender(t, server.URL, checkpoint)
+	second := testSender(t, server.URL, checkpointPath)
 	if err := second.Send(context.Background(), []model.Event{
 		event(1, "cups.service", model.StateDown, 1000),
 		event(2, "cups.service", model.StateUp, 2000),
@@ -213,8 +212,8 @@ func TestCurrentStateDoesNotAdvanceTransitionCheckpoint(t *testing.T) {
 	}))
 	defer server.Close()
 
-	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
-	s := testSender(t, server.URL, checkpoint)
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	s := testSender(t, server.URL, checkpointPath)
 	if err := s.SendCurrentStates(context.Background(), []model.ServiceState{{
 		Service:      "cups.service",
 		Availability: model.StateUp,
@@ -243,8 +242,8 @@ func TestRemoteWritePreservesEventTimestamp(t *testing.T) {
 	}))
 	defer server.Close()
 
-	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
-	s := testSender(t, server.URL, checkpoint)
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	s := testSender(t, server.URL, checkpointPath)
 	if err := s.Send(context.Background(), []model.Event{event(1, "cups.service", model.StateUp, eventTimestamp)}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
