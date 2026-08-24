@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,16 @@ func main() {
 	flag.Parse()
 	cfg, err := config.Load(*configPath)
 	if err != nil { log.Fatal(err) }
+
+	// Bind the HTTP listener before starting any exporter work. This makes the
+	// port check atomic with listener creation: if another exporter already
+	// owns the address, this process exits immediately and does not start D-Bus
+	// monitoring, WAL processing, or Remote Write delivery.
+	httpListener, err := net.Listen("tcp", cfg.Server.Listen)
+	if err != nil {
+		log.Fatalf("HTTP server: cannot listen on %s: %v", cfg.Server.Listen, err)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -34,7 +45,7 @@ func main() {
 	var eventLog *wal.WAL
 	if cfg.WAL.Enabled {
 		eventLog, err = wal.Open(cfg.WAL.Directory, cfg.WAL.Fsync)
-		if err != nil { log.Fatal(err) }
+		if err != nil { _ = httpListener.Close(); log.Fatal(err) }
 		defer eventLog.Close()
 	}
 
@@ -50,7 +61,7 @@ func main() {
 			durableEvents = events
 			for _, event := range events { eng.Replay(event); reg.Event(event) }
 			if len(events) > 0 { log.Printf("replayed %d durable transition events from WAL", len(events)) }
-		} else if !os.IsNotExist(e) { log.Fatalf("replay WAL: %v", e) }
+		} else if !os.IsNotExist(e) { _ = httpListener.Close(); log.Fatalf("replay WAL: %v", e) }
 	}
 
 	startupFrom := time.Now().Add(-cfg.Systemd.StartupRecoveryInterval)
@@ -69,7 +80,7 @@ func main() {
 		imported := 0
 		for _, recovered := range events {
 			for _, event := range eng.ApplyRecovery(recovered) {
-				if err := persist(event); err != nil { log.Fatalf("persist startup recovery event: %v", err) }
+				if err := persist(event); err != nil { _ = httpListener.Close(); log.Fatalf("persist startup recovery event: %v", err) }
 				reg.Event(event)
 				imported++
 				log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
@@ -85,7 +96,7 @@ func main() {
 		Checkpoint: cfg.RemoteWrite.Checkpoint, StateInterval: cfg.RemoteWrite.StateInterval,
 		Labels: cfg.RemoteWrite.Labels,
 	})
-	if err != nil { log.Fatal(err) }
+	if err != nil { _ = httpListener.Close(); log.Fatal(err) }
 
 	if rw != nil {
 		reg.SetRemoteWriteStats(rw.Stats())
@@ -200,8 +211,11 @@ func main() {
 		if !systemd.DebugDisconnect() { http.Error(w, "D-Bus connection is not active", http.StatusServiceUnavailable); return }
 		w.WriteHeader(http.StatusNoContent)
 	})
-	server := &http.Server{Addr: cfg.Server.Listen, Handler: mux}
-	go func() { log.Printf("listening on %s", cfg.Server.Listen); if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Printf("HTTP server: %v", err) } }()
+	server := &http.Server{Handler: mux}
+	go func() {
+		log.Printf("listening on %s", cfg.Server.Listen)
+		if err := server.Serve(httpListener); err != nil && err != http.ErrServerClosed { log.Printf("HTTP server: %v", err) }
+	}()
 	go func() {
 		err := systemd.RunResilient(ctx, cfg.Services, cfg.Systemd.ReconnectInterval, onSnapshot, func(connected bool, at time.Time) { reg.SetDBusConnected(connected, at); if connected { log.Printf("systemd D-Bus connected") } else { log.Printf("systemd D-Bus disconnected") } }, func(err error) { log.Printf("systemd D-Bus error: %v", err) }, onRecovery)
 		if err != nil && err != context.Canceled { log.Printf("systemd monitor stopped: %v", err); stop() }
