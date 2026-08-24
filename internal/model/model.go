@@ -42,6 +42,12 @@ type Event struct {
 	SystemdSubState string
 }
 
+type StateSample struct {
+	Service string
+	State AvailabilityState
+	TimestampUnixMS int64
+}
+
 type ServiceState struct {
 	Service string
 	Availability AvailabilityState
