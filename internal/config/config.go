@@ -32,6 +32,8 @@ type RemoteWriteConfig struct {
 	Timeout time.Duration `yaml:"timeout"`
 	Checkpoint string `yaml:"checkpoint"`
 	StateInterval time.Duration `yaml:"state_interval"`
+	RecoveryFillInterval time.Duration `yaml:"recovery_fill_interval"`
+	RecoveryWindow time.Duration `yaml:"recovery_window"`
 	Labels map[string]string `yaml:"labels"`
 }
 
@@ -52,6 +54,14 @@ func Load(path string) (Config, error) {
 		if c.RemoteWrite.Timeout <= 0 { c.RemoteWrite.Timeout = 10 * time.Second }
 		if c.RemoteWrite.Checkpoint == "" { c.RemoteWrite.Checkpoint = "/var/lib/systemd-transition-exporter/remote_write.checkpoint" }
 		if c.RemoteWrite.StateInterval <= 0 { c.RemoteWrite.StateInterval = time.Minute }
+		if c.RemoteWrite.RecoveryFillInterval <= 0 { c.RemoteWrite.RecoveryFillInterval = 2 * time.Minute }
+		if c.RemoteWrite.RecoveryWindow <= 0 { c.RemoteWrite.RecoveryWindow = 15 * time.Minute }
+		if c.RemoteWrite.RecoveryFillInterval < 10*time.Second || c.RemoteWrite.RecoveryFillInterval > 300*time.Second {
+			return Config{}, fmt.Errorf("remote_write.recovery_fill_interval must be between 10s and 300s")
+		}
+		if c.RemoteWrite.RecoveryWindow < 5*time.Minute || c.RemoteWrite.RecoveryWindow > 60*time.Minute {
+			return Config{}, fmt.Errorf("remote_write.recovery_window must be between 5m and 60m")
+		}
 		for name := range c.RemoteWrite.Labels {
 			if !validLabelName(name) || name == "__name__" { return Config{}, fmt.Errorf("invalid remote_write label name %q", name) }
 		}
