@@ -49,6 +49,9 @@ func RecoveryWindow(from, to time.Time, size time.Duration) [][2]time.Time {
 // BuildStateBackfill creates timestamped state samples at interval-aligned
 // points inside a recovered window. The state at the beginning of the window
 // is taken from the latest journal transition at or before the window start.
+// If the configured service has no transition history, it is treated as down:
+// a configured but never-started service is still a valid time series and must
+// remain present in Prometheus during exporter downtime.
 // Each sample represents the state effective at that timestamp.
 func BuildStateBackfill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration) ([]model.StateSample, error) {
 	if interval <= 0 || !end.After(start) {
@@ -74,7 +77,10 @@ func BuildStateBackfill(ctx context.Context, services []string, start, end time.
 			return nil, err
 		}
 		if !ok {
-			continue
+			// The service is explicitly configured but has no lifecycle event
+			// in the journal. Its Prometheus availability state is therefore
+			// down until systemd reports a successful start.
+			state = model.StateDown
 		}
 
 		serviceEvents := byService[service]
