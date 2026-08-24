@@ -1,7 +1,7 @@
 BINARY := bin/systemd-transition-exporter
 CMD := ./cmd/systemd-transition-exporter
 
-.PHONY: all build test check clean tidy
+.PHONY: all build build-rocky8 test check clean tidy
 
 all: check
 
@@ -11,6 +11,13 @@ build:
 	mkdir -p bin
 	go build -o $(BINARY) $(CMD)
 
+# Build a Linux amd64 binary suitable for Rocky Linux 8.x.
+# CGO is disabled so the binary does not depend on the target system's glibc.
+build-rocky8:
+	mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		go build -trimpath -ldflags="-s -w" -o $(BINARY) $(CMD)
+
 # Run the unit tests for all packages.
 test:
 	go test ./...
@@ -18,7 +25,6 @@ test:
 # Verify tests and build the executable that will be deployed.
 check: test build
 
-# Synchronize module dependencies and go.sum.
 tidy:
 	go mod tidy
 
