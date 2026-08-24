@@ -117,7 +117,8 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 		return model.StateUnknown, false, fmt.Errorf("journalctl %s: %w", service, err)
 	}
 
-	var latest *journalRecord
+	var foundState model.AvailabilityState
+	found := false
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -133,10 +134,8 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 		if us == 0 || us/1000 > uint64(at.UnixMilli()) {
 			continue
 		}
-		copy := r
-		copy.MessageID = state.String()
-		copy.RTUS = fmt.Sprintf("%d", us)
-		latest = &copy
+		foundState = state
+		found = true
 		break
 	}
 	if err := scanner.Err(); err != nil {
@@ -146,20 +145,5 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 	if err := cmd.Wait(); err != nil && exitCode(err) != 1 {
 		return model.StateUnknown, false, fmt.Errorf("journalctl %s: %w", service, err)
 	}
-	if latest == nil {
-		return model.StateUnknown, false, nil
-	}
-	state, ok := messageState(latest.MessageID, "")
-	if !ok {
-		// previousState stores the parsed state name in MessageID to avoid a
-		// second parsing structure; restore it explicitly here.
-		if latest.MessageID == "up" {
-			return model.StateUp, true, nil
-		}
-		if latest.MessageID == "down" {
-			return model.StateDown, true, nil
-		}
-		return model.StateUnknown, false, nil
-	}
-	return state, true, nil
+	return foundState, found, nil
 }
