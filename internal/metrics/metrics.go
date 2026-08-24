@@ -99,43 +99,50 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	defer r.mu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 
-	// Prometheus exposition metadata. Each metric family has exactly one HELP
-	// and TYPE declaration before its samples.
+	// Prometheus exposition format requires HELP/TYPE metadata to describe a
+	// metric family. Keep each metadata block immediately before that family's
+	// samples instead of grouping metadata for several families together.
 	fmt.Fprintln(w, "# HELP systemd_service_state Current availability state of the systemd service (1 for active, 0 otherwise).")
 	fmt.Fprintln(w, "# TYPE systemd_service_state gauge")
-	fmt.Fprintln(w, "# HELP systemd_service_transitions_total Total number of observed systemd service state transitions, partitioned by resulting state.")
-	fmt.Fprintln(w, "# TYPE systemd_service_transitions_total counter")
-	fmt.Fprintln(w, "# HELP systemd_service_last_transition_timestamp_seconds Unix timestamp of the last observed systemd service state transition.")
-	fmt.Fprintln(w, "# TYPE systemd_service_last_transition_timestamp_seconds gauge")
-
 	for service, state := range r.states {
 		v := 0
 		if state == model.StateUp {
 			v = 1
 		}
 		fmt.Fprintf(w, "systemd_service_state{service=%q} %d\n", service, v)
+	}
+
+	fmt.Fprintln(w, "# HELP systemd_service_transitions_total Total number of observed systemd service state transitions, partitioned by resulting state.")
+	fmt.Fprintln(w, "# TYPE systemd_service_transitions_total counter")
+	for service := range r.states {
 		fmt.Fprintf(w, "systemd_service_transitions_total{service=%q,state=\"up\"} %d\n", service, r.up[service])
 		fmt.Fprintf(w, "systemd_service_transitions_total{service=%q,state=\"down\"} %d\n", service, r.down[service])
+	}
+
+	fmt.Fprintln(w, "# HELP systemd_service_last_transition_timestamp_seconds Unix timestamp of the last observed systemd service state transition.")
+	fmt.Fprintln(w, "# TYPE systemd_service_last_transition_timestamp_seconds gauge")
+	for service := range r.states {
 		fmt.Fprintf(w, "systemd_service_last_transition_timestamp_seconds{service=%q} %g\n", service, float64(r.last[service])/1000)
 	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_connected Whether the exporter is currently connected to the system D-Bus (1 connected, 0 disconnected).")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_connected gauge")
-	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_disconnects_total Total number of system D-Bus disconnections observed by the exporter.")
-	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_disconnects_total counter")
-	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_last_change_timestamp_seconds Unix timestamp of the last system D-Bus connection state change.")
-	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_last_change_timestamp_seconds gauge")
-	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_disconnected_seconds Duration in seconds of the current system D-Bus disconnection, or 0 when connected.")
-	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_disconnected_seconds gauge")
-
 	dbusState := 0
 	if r.dbusConnected {
 		dbusState = 1
 	}
 	fmt.Fprintf(w, "systemd_transition_exporter_dbus_connected %d\n", dbusState)
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_disconnects_total Total number of system D-Bus disconnections observed by the exporter.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_disconnects_total counter")
 	fmt.Fprintf(w, "systemd_transition_exporter_dbus_disconnects_total %d\n", r.dbusDisconnects)
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_last_change_timestamp_seconds Unix timestamp of the last system D-Bus connection state change.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_last_change_timestamp_seconds gauge")
 	fmt.Fprintf(w, "systemd_transition_exporter_dbus_last_change_timestamp_seconds %g\n", float64(r.dbusLastChangeMS)/1000)
 
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_dbus_disconnected_seconds Duration in seconds of the current system D-Bus disconnection, or 0 when connected.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_dbus_disconnected_seconds gauge")
 	disconnectedSeconds := 0.0
 	if !r.dbusConnected && !r.dbusDisconnectedAt.IsZero() {
 		disconnectedSeconds = time.Since(r.dbusDisconnectedAt).Seconds()
@@ -144,15 +151,17 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_successful_requests_total Total number of successful Remote Write HTTP requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_successful_requests_total counter")
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_successful_requests_total %d\n", r.remoteWrite.SuccessfulRequests)
+
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_failed_requests_total Total number of failed Remote Write HTTP requests or rejected requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_failed_requests_total counter")
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_failed_requests_total %d\n", r.remoteWrite.FailedRequests)
+
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_retries_total Total number of Remote Write retry attempts.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_retries_total counter")
+	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_retries_total %d\n", r.remoteWrite.Retries)
+
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_samples_sent_total Total number of samples accepted by the Remote Write endpoint in successful requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_samples_sent_total counter")
-
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_successful_requests_total %d\n", r.remoteWrite.SuccessfulRequests)
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_failed_requests_total %d\n", r.remoteWrite.FailedRequests)
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_retries_total %d\n", r.remoteWrite.Retries)
 	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_samples_sent_total %d\n", r.remoteWrite.SentSamples)
 }
