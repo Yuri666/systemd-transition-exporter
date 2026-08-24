@@ -12,64 +12,27 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
-// RecoveryWindow returns aligned recovery windows covering [from, to].
-// The grid is anchored at the start of every hour, so a configured window
-// always starts at HH:00, HH:<N>, ... and resets at the next hour.
-func RecoveryWindow(from, to time.Time, size time.Duration) [][2]time.Time {
-	if size <= 0 || !to.After(from) {
-		return nil
+// RecoveryWindow returns only the current local-time slot [slot start, ready).
+// The beginning of the observed outage is deliberately not used to widen the
+// journal query into already closed slots.
+func RecoveryWindow(ready time.Time, size time.Duration) (time.Time, time.Time, bool) {
+	if size <= 0 {
+		return time.Time{}, time.Time{}, false
 	}
-	var out [][2]time.Time
-	hour := time.Date(from.Year(), from.Month(), from.Day(), from.Hour(), 0, 0, 0, from.Location())
-	for !hour.After(to) {
-		for offset := time.Duration(0); offset < time.Hour; offset += size {
-			start := hour.Add(offset)
-			if start.Before(from) && start.Add(size).Before(from) {
-				continue
-			}
-			if start.After(to) {
-				break
-			}
-			end := start.Add(size)
-			if end.After(hour.Add(time.Hour)) {
-				end = hour.Add(time.Hour)
-			}
-			if end.After(to) {
-				end = to
-			}
-			if end.After(start) {
-				out = append(out, [2]time.Time{start, end})
-			}
-		}
-		hour = hour.Add(time.Hour)
+	local := ready
+	hour := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, local.Location())
+	start := hour.Add(time.Duration(local.Minute()) * time.Minute / size * size)
+	if !ready.After(start) {
+		return time.Time{}, time.Time{}, false
 	}
-	return out
+	return start, ready, true
 }
 
-// BuildStateBackfill creates timestamped state samples at interval-aligned
-// points inside a recovered window. The state at the beginning of the window
-// is taken from the latest journal transition at or before the window start.
-// If the configured service has no transition history, it is treated as down:
-// a configured but never-started service is still a valid time series and must
-// remain present in Prometheus during exporter downtime.
-// Each sample represents the state effective at that timestamp.
-func BuildStateBackfill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration) ([]model.StateSample, error) {
-	if interval <= 0 || !end.After(start) {
-		return nil, nil
-	}
-	byService := make(map[string][]model.Event)
-	for _, event := range events {
-		if event.EventTimeUnixMS < start.UnixMilli() || event.EventTimeUnixMS >= end.UnixMilli() {
-			continue
-		}
-		byService[event.Service] = append(byService[event.Service], event)
-	}
-	for service := range byService {
-		sort.SliceStable(byService[service], func(i, j int) bool {
-			return byService[service][i].EventTimeUnixMS < byService[service][j].EventTimeUnixMS
-		})
-	}
-
+// BuildStateBaseline creates exactly one state sample per configured service
+// at the beginning of the recovered slot. The state is taken from the latest
+// journal transition strictly before the slot. A configured service with no
+// lifecycle history is treated as DOWN.
+func BuildStateBaseline(ctx context.Context, services []string, start time.Time) ([]model.StateSample, error) {
 	var out []model.StateSample
 	for _, service := range services {
 		state, ok, err := previousState(ctx, service, start)
@@ -82,16 +45,7 @@ func BuildStateBackfill(ctx context.Context, services []string, start, end time.
 			// down until systemd reports a successful start.
 			state = model.StateDown
 		}
-
-		serviceEvents := byService[service]
-		eventIndex := 0
-		for ts := start; ts.Before(end); ts = ts.Add(interval) {
-			for eventIndex < len(serviceEvents) && serviceEvents[eventIndex].EventTimeUnixMS <= ts.UnixMilli() {
-				state = serviceEvents[eventIndex].State
-				eventIndex++
-			}
-			out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: ts.UnixMilli()})
-		}
+		out = append(out, model.StateSample{Service: service, State: state, TimestampUnixMS: start.UnixMilli()})
 	}
 
 	sort.SliceStable(out, func(i, j int) bool {
@@ -111,7 +65,7 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 		"--no-pager",
 		"--quiet",
 		"--reverse",
-		"-n", "50",
+		"-n", "1",
 		"MESSAGE_ID=" + messageIDUnitStarted,
 		"MESSAGE_ID=" + messageIDUnitStopped,
 		"MESSAGE_ID=" + messageIDUnitFailed,
@@ -139,7 +93,7 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 			continue
 		}
 		us := parseTimestampUS(r.RTUS)
-		if us == 0 || us/1000 > at.UnixMilli() {
+		if us == 0 || us/1000 >= at.UnixMilli() {
 			continue
 		}
 		foundState = state

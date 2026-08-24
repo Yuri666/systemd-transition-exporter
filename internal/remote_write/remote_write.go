@@ -9,26 +9,27 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
 type Config struct {
-	Enabled        bool
-	URL            string
-	BatchSize      int
-	FlushInterval  time.Duration
-	RetryInterval  time.Duration
-	Timeout        time.Duration
-	Checkpoint     string
-	StateInterval  time.Duration
-	Labels         map[string]string
+	Enabled       bool
+	URL           string
+	BatchSize     int
+	FlushInterval time.Duration
+	RetryInterval time.Duration
+	Timeout       time.Duration
+	Checkpoint    string
+	StateInterval time.Duration
+	Labels        map[string]string
 }
 
 type Stats struct {
@@ -350,7 +351,7 @@ func (s *Sender) saveCheckpoint(seq uint64) error {
 	if err != nil {
 		return fmt.Errorf("open checkpoint directory: %w", err)
 	}
-	if err := dir.Sync(); err != nil {
+	if err := dir.Sync(); err != nil && runtime.GOOS != "windows" {
 		_ = dir.Close()
 		return fmt.Errorf("sync checkpoint directory: %w", err)
 	}

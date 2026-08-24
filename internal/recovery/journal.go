@@ -108,7 +108,7 @@ func recoverUnit(ctx context.Context, service string, from, to time.Time) ([]mod
 			continue
 		}
 		t := time.Unix(0, us*1000)
-		if t.Before(from) || t.After(to) {
+		if t.Before(from) || !t.Before(to) {
 			continue
 		}
 		out = append(out, model.Event{

@@ -159,9 +159,7 @@ Example:
 ```yaml
 server:
   listen: "0.0.0.0:9877"
-
-debug:
-  enabled: false
+  debug: false
 
 services:
   - pcscf.service
@@ -171,6 +169,7 @@ services:
 systemd:
   reconnect_interval: 1s
   reconciliation_interval: 30s
+  startup_recovery_interval: 24h
 
 wal:
   enabled: true
@@ -186,13 +185,14 @@ remote_write:
   timeout: 10s
   checkpoint: /var/lib/systemd-transition-exporter/remote_write.checkpoint
   state_interval: 1m
+  recovery_window: 15m
   labels:
     environment: production
     site: lab01
     role: ims
 ```
 
-`server.listen` is the HTTP listen address. `services` contains the systemd units to monitor. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect.
+`server.listen` is the HTTP listen address. `server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
 
 `wal.enabled`, `wal.directory` and `wal.fsync` control the durable collector event log. The WAL file is `<wal.directory>/events.jsonl`.
 
@@ -356,6 +356,10 @@ The complete metric set is therefore:
 | `systemd_transition_exporter_remote_write_failed_requests_total` | **Yes** | No | Failed Remote Write requests |
 | `systemd_transition_exporter_remote_write_retries_total` | **Yes** | No | Remote Write retries |
 | `systemd_transition_exporter_remote_write_samples_sent_total` | **Yes** | No | Samples accepted by Remote Write |
+| `systemd_transition_exporter_recovery_attempts_total` | **Yes** | No | Aligned recovery slots attempted |
+| `systemd_transition_exporter_recovery_slot_start_timestamp_seconds` | **Yes** | No | Start of the last recovered slot |
+| `systemd_transition_exporter_recovery_slot_end_timestamp_seconds` | **Yes** | No | End of the last journal query |
+| `systemd_transition_exporter_recovery_uncovered_seconds` | **Yes** | No | Requested gap intentionally excluded before the current slot |
 
 > **Note:** `systemd_service_transitions_total` and `systemd_service_last_transition_timestamp_seconds` are part of the historical service metric model/WAL state but are deliberately not emitted by the current `/metrics` handler. The authoritative service-state timeline delivered to Prometheus is `systemd_service_state` through Remote Write.
 
@@ -431,6 +435,18 @@ The engine compares previous and current systemd enter/exit timestamps and emits
 
 Systemd unit properties are not a complete historical event log. Therefore transitions during a D-Bus monitoring gap are recovered from journald.
 
+Recovery is deliberately limited to the current local-time slot. With the
+default `remote_write.recovery_window: 15m`, an exporter becoming ready at
+`15:14` reads transition events only from `[15:00, 15:14)`. It queries the
+single latest lifecycle event before `15:00` to establish the baseline state.
+An outage beginning at `14:47` does not cause the closed `14:45..15:00` slot
+to be rewritten; the excluded 13 minutes are exposed as
+`systemd_transition_exporter_recovery_uncovered_seconds`.
+
+One baseline sample per configured service is written at `15:00`, followed by
+the actual journal transitions in timestamp order. Periodic synthetic samples
+inside the recovered slot are not generated.
+
 ## Host reboot
 
 The exporter reads:
@@ -439,7 +455,10 @@ The exporter reads:
 /proc/sys/kernel/random/boot_id
 ```
 
-A boot ID change identifies a host reboot. Reboot is explicitly treated as downtime for services that were UP before the reboot.
+A boot ID change identifies a host reboot. The latest state and boot ID are
+persisted independently from transition events, so a service that was already
+UP before the exporter started can still be recognized after reboot. Services
+that were UP receive a synthetic DOWN event at the current host boot time.
 
 ## WAL
 
@@ -451,6 +470,12 @@ The collector WAL is append-only JSON Lines:
 
 Each record contains the event sequence, service, state, wall-clock timestamp, monotonic timestamp, boot ID, source and systemd state information.
 
+The latest observed service state is stored separately in:
+
+```text
+/var/lib/systemd-transition-exporter/wal/state.json
+```
+
 The WAL provides durable storage of events already detected by the collector and replay on startup. Remote Write has a separate delivery checkpoint. Heartbeat samples do not advance the transition checkpoint.
 
 Remote Write is deliberately **at-least-once**. The checkpoint advances only after the receiver returns `2xx` and the checkpoint file has been durably persisted. A crash in the narrow interval after receiver acceptance but before checkpoint persistence can cause a sample to be sent again after restart.
@@ -460,8 +485,8 @@ Remote Write is deliberately **at-least-once**. The checkpoint advances only aft
 For controlled D-Bus recovery testing, when debug functionality is enabled:
 
 ```yaml
-debug:
-  enabled: true
+server:
+  debug: true
 ```
 
 force a disconnect of the exporter's current D-Bus connection with:
@@ -541,7 +566,7 @@ make check
 
 - D-Bus reconnect;
 - explicit D-Bus connectivity metrics;
-- reconciliation after reconnect;
+- periodic reconciliation and reconciliation after reconnect;
 - host reboot detection.
 
 ### Gap recovery
@@ -562,7 +587,6 @@ make check
 
 ### Production hardening
 
-- reboot-gap reconciliation across old and new boots;
 - WAL rotation/retention;
 - integration tests against a real systemd instance;
 - load tests with large unit sets;

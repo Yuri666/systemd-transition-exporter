@@ -2,6 +2,7 @@ package engine
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
@@ -83,5 +84,42 @@ func TestOnlyActiveIsUp(t *testing.T) {
 	state, _ := e.State("test.service")
 	if state.Availability != model.StateUp {
 		t.Fatalf("ActiveState=active mapped to %v, want up", state.Availability)
+	}
+}
+
+func TestHostRebootMarksPreviouslyUpServiceDown(t *testing.T) {
+	e := New()
+	e.RestoreState(model.ServiceState{
+		Service:      "pcscf.service",
+		Availability: model.StateUp,
+		BootID:       "old-boot",
+	})
+	at := time.Date(2026, 8, 24, 15, 2, 3, 0, time.UTC)
+	events := e.ApplyReboot("new-boot", at)
+	if len(events) != 1 {
+		t.Fatalf("got %d reboot events, want 1", len(events))
+	}
+	if events[0].State != model.StateDown || events[0].Source != model.SourceHostReboot || events[0].EventTimeUnixMS != at.UnixMilli() {
+		t.Fatalf("unexpected reboot event: %+v", events[0])
+	}
+	state, _ := e.State("pcscf.service")
+	if state.Availability != model.StateDown || state.BootID != "new-boot" {
+		t.Fatalf("unexpected post-reboot state: %+v", state)
+	}
+}
+
+func TestHostRebootDoesNotEmitForAlreadyDownService(t *testing.T) {
+	e := New()
+	e.RestoreState(model.ServiceState{
+		Service:      "pcscf.service",
+		Availability: model.StateDown,
+		BootID:       "old-boot",
+	})
+	if events := e.ApplyReboot("new-boot", time.Now()); len(events) != 0 {
+		t.Fatalf("already-down service emitted reboot events: %+v", events)
+	}
+	state, _ := e.State("pcscf.service")
+	if state.BootID != "new-boot" {
+		t.Fatalf("boot id was not advanced: %+v", state)
 	}
 }

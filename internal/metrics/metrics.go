@@ -23,6 +23,11 @@ type Registry struct {
 	dbusDisconnectedAt time.Time
 
 	remoteWrite remote_write.Stats
+
+	recoveryAttempts    uint64
+	recoverySlotStartMS int64
+	recoverySlotEndMS   int64
+	uncoveredSeconds    float64
 }
 
 func New() *Registry {
@@ -94,6 +99,21 @@ func (r *Registry) SetRemoteWriteStats(stats remote_write.Stats) {
 	r.remoteWrite = stats
 }
 
+// RecordRecovery records the aligned slot selected for journal recovery.
+// Any part of the requested observation gap before slotStart is intentionally
+// left uncovered and reported separately.
+func (r *Registry) RecordRecovery(observedFrom, slotStart, slotEnd time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recoveryAttempts++
+	r.recoverySlotStartMS = slotStart.UnixMilli()
+	r.recoverySlotEndMS = slotEnd.UnixMilli()
+	r.uncoveredSeconds = 0
+	if observedFrom.Before(slotStart) {
+		r.uncoveredSeconds = slotStart.Sub(observedFrom).Seconds()
+	}
+}
+
 func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -143,4 +163,20 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_samples_sent_total Total number of samples accepted by the Remote Write endpoint in successful requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_samples_sent_total counter")
 	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_samples_sent_total %d\n", r.remoteWrite.SentSamples)
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_recovery_attempts_total Total number of aligned journal recovery slots attempted.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_recovery_attempts_total counter")
+	fmt.Fprintf(w, "systemd_transition_exporter_recovery_attempts_total %d\n", r.recoveryAttempts)
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_recovery_slot_start_timestamp_seconds Start of the last local-time recovery slot as a Unix timestamp.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_recovery_slot_start_timestamp_seconds gauge")
+	fmt.Fprintf(w, "systemd_transition_exporter_recovery_slot_start_timestamp_seconds %g\n", float64(r.recoverySlotStartMS)/1000)
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_recovery_slot_end_timestamp_seconds End of the last journal recovery query as a Unix timestamp.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_recovery_slot_end_timestamp_seconds gauge")
+	fmt.Fprintf(w, "systemd_transition_exporter_recovery_slot_end_timestamp_seconds %g\n", float64(r.recoverySlotEndMS)/1000)
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_recovery_uncovered_seconds Portion of the last requested observation gap before the current recovery slot that was intentionally not recovered.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_recovery_uncovered_seconds gauge")
+	fmt.Fprintf(w, "systemd_transition_exporter_recovery_uncovered_seconds %g\n", r.uncoveredSeconds)
 }

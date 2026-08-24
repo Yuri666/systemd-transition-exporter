@@ -69,3 +69,20 @@ func TestHandlerGroupsHelpAndTypeByMetricFamily(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoveryMetricsExposeOnlyExcludedPartBeforeSlot(t *testing.T) {
+	r := New()
+	loc := time.FixedZone("TEST", 3*60*60)
+	observedFrom := time.Date(2026, 8, 24, 14, 47, 0, 0, loc)
+	slotStart := time.Date(2026, 8, 24, 15, 0, 0, 0, loc)
+	slotEnd := time.Date(2026, 8, 24, 15, 14, 0, 0, loc)
+	r.RecordRecovery(observedFrom, slotStart, slotEnd)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.Handler(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, "systemd_transition_exporter_recovery_uncovered_seconds 780") {
+		t.Fatalf("unexpected uncovered recovery metric:\n%s", body)
+	}
+}
