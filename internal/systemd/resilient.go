@@ -45,6 +45,17 @@ func RunResilient(ctx context.Context, services []string, reconnectInterval time
 		if setupFailed { _ = d.Close(); SetDebugDBus(nil); continue }
 		bootID, err := BootID()
 		if err != nil { _ = d.Close(); SetDebugDBus(nil); return fmt.Errorf("read boot id: %w", err) }
+
+		// Recover the historical gap before taking the reconnect snapshot.
+		// This guarantees that Remote Write receives historical samples before
+		// the current-state heartbeat queued by onSnapshot, preserving the
+		// per-series timestamp ordering required by Remote Write.
+		if !disconnectedAt.IsZero() && onRecovery != nil {
+			until := time.Now()
+			if err := onRecovery(disconnectedAt, until); err != nil && onConnectionError != nil { onConnectionError(fmt.Errorf("journal recovery: %w", err)) }
+			disconnectedAt = time.Time{}
+		}
+
 		for _, service := range services {
 			u := m.byService(service); if u == nil { continue }
 			s, e := u.Snapshot(bootID)
@@ -52,11 +63,6 @@ func RunResilient(ctx context.Context, services []string, reconnectInterval time
 			if e = onSnapshot(s); e != nil { _ = d.Close(); SetDebugDBus(nil); return e }
 		}
 		if setupFailed { _ = d.Close(); SetDebugDBus(nil); continue }
-		if !disconnectedAt.IsZero() && onRecovery != nil {
-			until := time.Now()
-			if err := onRecovery(disconnectedAt, until); err != nil && onConnectionError != nil { onConnectionError(fmt.Errorf("journal recovery: %w", err)) }
-			disconnectedAt = time.Time{}
-		}
 		if onConnectionState != nil { onConnectionState(true, time.Now()) }
 		connectedOnce = true
 		runErr := m.Run(ctx, func(u *Unit) error {
