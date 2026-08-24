@@ -29,9 +29,7 @@ func main() {
 	if err != nil { log.Fatal(err) }
 
 	httpListener, err := net.Listen("tcp", cfg.Server.Listen)
-	if err != nil {
-		log.Fatalf("HTTP server: cannot listen on %s: %v", cfg.Server.Listen, err)
-	}
+	if err != nil { log.Fatalf("HTTP server: cannot listen on %s: %v", cfg.Server.Listen, err) }
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -94,14 +92,8 @@ func main() {
 	if rw != nil {
 		reg.SetRemoteWriteStats(rw.Stats())
 		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C: reg.SetRemoteWriteStats(rw.Stats())
-				case <-ctx.Done(): reg.SetRemoteWriteStats(rw.Stats()); return
-				}
-			}
+			ticker := time.NewTicker(5 * time.Second); defer ticker.Stop()
+			for { select { case <-ticker.C: reg.SetRemoteWriteStats(rw.Stats()); case <-ctx.Done(): reg.SetRemoteWriteStats(rw.Stats()); return } }
 		}()
 	}
 
@@ -116,36 +108,20 @@ func main() {
 			}
 
 			batch := make([]model.Event, 0, cfg.RemoteWrite.BatchSize)
-			timer := time.NewTicker(cfg.RemoteWrite.FlushInterval)
-			stateTimer := time.NewTicker(cfg.RemoteWrite.StateInterval)
+			timer := time.NewTicker(cfg.RemoteWrite.FlushInterval); stateTimer := time.NewTicker(cfg.RemoteWrite.StateInterval)
 			defer timer.Stop(); defer stateTimer.Stop()
-			flush := func() {
-				if len(batch) == 0 { return }
-				if e := rw.Send(ctx, batch); e != nil && ctx.Err() == nil { log.Printf("remote_write send failed: %v", e) } else { batch = batch[:0] }
-			}
+			flush := func() { if len(batch) == 0 { return }; if e := rw.Send(ctx, batch); e != nil && ctx.Err() == nil { log.Printf("remote_write send failed: %v", e) } else { batch = batch[:0] } }
 			drainEvents := func() { for { select { case e := <-eventQueue: batch = append(batch, e); default: return } } }
-			sendQueuedStates := func() {
-			for {
-				select {
-				case state := <-stateQueue:
-					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
-				default: return
-				}
-			}
-		}
+			sendQueuedStates := func() { for { select { case state := <-stateQueue: if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }; default: return } } }
 
 			for {
 				select {
-				case e := <-eventQueue:
-					batch = append(batch, e)
-					if len(batch) >= cfg.RemoteWrite.BatchSize { flush() }
-				case state := <-stateQueue:
-					if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
+				case e := <-eventQueue: batch = append(batch, e); if len(batch) >= cfg.RemoteWrite.BatchSize { flush() }
+				case state := <-stateQueue: if e := rw.SendCurrentStates(ctx, []model.ServiceState{state}); e != nil && ctx.Err() == nil { log.Printf("remote_write startup state failed for %s: %v", state.Service, e) }
 				case <-timer.C: drainEvents(); flush()
 				case <-stateTimer.C:
 					drainEvents(); flush(); sendQueuedStates()
-					states := make([]model.ServiceState, 0, len(cfg.Services))
-					for _, service := range cfg.Services { if st, ok := eng.State(service); ok { states = append(states, st) } }
+					states := make([]model.ServiceState, 0, len(cfg.Services)); for _, service := range cfg.Services { if st, ok := eng.State(service); ok { states = append(states, st) } }
 					if e := rw.SendCurrentStates(ctx, states); e != nil && ctx.Err() == nil { log.Printf("remote_write state heartbeat failed: %v", e) }
 				case <-ctx.Done(): drainEvents(); flush(); return
 				}
@@ -155,9 +131,7 @@ func main() {
 
 	persistEvent := func(event model.Event, enqueue bool) error {
 		if eventLog != nil { if err := eventLog.Append(event); err != nil { return err } }
-		if enqueue && rw != nil {
-			select { case eventQueue <- event: default: log.Printf("remote_write queue full; event seq=%d remains durable in WAL", event.Sequence) }
-		}
+		if enqueue && rw != nil { select { case eventQueue <- event: default: log.Printf("remote_write queue full; event seq=%d remains durable in WAL", event.Sequence) } }
 		return nil
 	}
 	persist = func(event model.Event) error { return persistEvent(event, true) }
@@ -165,8 +139,7 @@ func main() {
 	onSnapshot := func(s model.UnitSnapshot) error {
 		for _, event := range eng.Apply(s) {
 			if err := persist(event); err != nil { return err }
-			reg.Event(event)
-			log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
+			reg.Event(event); log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 		}
 		state := model.ServiceState{Service: s.Service, Availability: currentState(s.ActiveState), ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID}
 		if existing, ok := eng.State(s.Service); ok { state = existing }
@@ -182,26 +155,21 @@ func main() {
 			windowStart, windowEnd := window[0], window[1]
 			events, err := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd)
 			if err != nil { return err }
-
+			windowEvents := make([]model.Event, 0, len(events))
 			recovered := make([]model.Event, 0, len(events))
 			for _, candidate := range events {
-				// Adjacent aligned windows share a boundary. Keep the event in
-				// only the window where its timestamp is strictly before the end.
 				if candidate.EventTimeUnixMS >= windowEnd.UnixMilli() && windowEnd.Before(to) { continue }
+				windowEvents = append(windowEvents, candidate)
 				for _, event := range eng.ApplyRecovery(candidate) {
 					if err := persistEvent(event, false); err != nil { return err }
-					reg.Event(event)
-					recovered = append(recovered, event)
-					count++
+					reg.Event(event); recovered = append(recovered, event); count++
 					log.Printf("recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 				}
 			}
 
-			// Deliver real transitions first, then continuity samples. Both
-			// calls are serialized by Sender.sendMu, preserving per-series order.
 			if rw != nil {
 				if err := rw.Send(ctx, recovered); err != nil { return err }
-				backfill, err := recovery.BuildStateBackfill(ctx, cfg.Services, windowStart, windowEnd, recovered, cfg.RemoteWrite.RecoveryFillInterval)
+				backfill, err := recovery.BuildStateBackfill(ctx, cfg.Services, windowStart, windowEnd, windowEvents, cfg.RemoteWrite.RecoveryFillInterval)
 				if err != nil { return err }
 				if err := rw.SendRecoveredStates(ctx, backfill); err != nil { return err }
 				if len(backfill) > 0 { log.Printf("recovery state backfill window=%s..%s interval=%s samples=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), cfg.RemoteWrite.RecoveryFillInterval, len(backfill)) }
@@ -215,16 +183,9 @@ func main() {
 	mux.HandleFunc("/metrics", reg.Handler)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/debug/dbus/disconnect", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
-		if !systemd.DebugDisconnect() { http.Error(w, "D-Bus connection is not active", http.StatusServiceUnavailable); return }
-		w.WriteHeader(http.StatusNoContent)
-	})
+	mux.HandleFunc("/debug/dbus/disconnect", func(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }; if !systemd.DebugDisconnect() { http.Error(w, "D-Bus connection is not active", http.StatusServiceUnavailable); return }; w.WriteHeader(http.StatusNoContent) })
 	server := &http.Server{Handler: mux}
-	go func() {
-		log.Printf("listening on %s", cfg.Server.Listen)
-		if err := server.Serve(httpListener); err != nil && err != http.ErrServerClosed { log.Printf("HTTP server: %v", err) }
-	}()
+	go func() { log.Printf("listening on %s", cfg.Server.Listen); if err := server.Serve(httpListener); err != nil && err != http.ErrServerClosed { log.Printf("HTTP server: %v", err) } }()
 	go func() {
 		err := systemd.RunResilient(ctx, cfg.Services, cfg.Systemd.ReconnectInterval, onSnapshot, func(connected bool, at time.Time) { reg.SetDBusConnected(connected, at); if connected { log.Printf("systemd D-Bus connected") } else { log.Printf("systemd D-Bus disconnected") } }, func(err error) { log.Printf("systemd D-Bus error: %v", err) }, onRecovery)
 		if err != nil && err != context.Canceled { log.Printf("systemd monitor stopped: %v", err); stop() }
