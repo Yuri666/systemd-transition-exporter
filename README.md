@@ -235,6 +235,33 @@ The same `systemd_service_state` metric is also used for the current-state heart
 
 The sender retries failed delivery and maintains a durable checkpoint of the last successfully delivered transition sequence. A successful HTTP `2xx` response advances the checkpoint; failed requests do not.
 
+### Required Prometheus receiver setup
+
+Two things have to be enabled on the Prometheus side. The receiving endpoint is
+a command line flag:
+
+```text
+prometheus --web.enable-remote-write-receiver
+```
+
+which makes `POST /api/v1/write` available, so `remote_write.url` is normally
+`http://<prometheus>:9090/api/v1/write`.
+
+Out-of-order ingestion, in contrast, is **not** a command line flag; it is a
+field of `prometheus.yml`:
+
+```yaml
+storage:
+  tsdb:
+    out_of_order_time_window: 30m
+```
+
+Without it every sample older than the head of a series is rejected, which
+discards exactly the history this exporter exists to deliver: recovered
+transitions and republished slots. See
+[Multiple transitions between observations](#multiple-transitions-between-observations)
+for how the window relates to `remote_write.recovery_window`.
+
 ### Remote Write labels
 
 `remote_write.labels` is a free-form YAML map. Every configured label is added to the Remote Write `systemd_service_state` series:
@@ -289,8 +316,8 @@ missed both transitions and heartbeats:
   being retried forever, because an unchanged payload would be rejected again
   and would block every later transition. The events remain in the WAL and
   `systemd_transition_exporter_remote_write_dropped_events_total` is increased.
-  A growing counter almost always means
-  `--storage.tsdb.out-of-order-time-window` is smaller than one recovery slot.
+  A growing counter almost always means the receiver accepts no out-of-order
+  samples, or accepts a window smaller than one recovery slot.
 
 ## Prometheus metrics (`/metrics`)
 
@@ -492,9 +519,17 @@ Each recovered slot therefore contains:
 - one sample at the exact timestamp of every recovered transition.
 
 Samples inside the slot may be older than data Prometheus already holds, for
-example when only the last minutes of the slot were missing. Keep
-`--storage.tsdb.out-of-order-time-window` at least as large as one slot so
-these are accepted.
+example when only the last minutes of the slot were missing. Prometheus rejects
+those unless `storage.tsdb.out_of_order_time_window` is configured, as described
+in [Required Prometheus receiver setup](#required-prometheus-receiver-setup).
+The window has to cover both the slot itself and the delay with which the
+exporter may republish it, so keep it comfortably above
+`remote_write.recovery_window`.
+
+Delivery of out-of-order samples can be verified from both sides:
+`prometheus_tsdb_out_of_order_samples_appended_total` grows on Prometheus, while
+`systemd_transition_exporter_remote_write_dropped_events_total` stays at zero on
+the exporter.
 
 ## Host reboot
 
