@@ -78,6 +78,71 @@ type checkpoint struct {
 	LastSequence uint64 `json:"last_sequence"`
 }
 
+// MigrateCheckpoint copies a legacy single-target checkpoint to the stable
+// per-target path. The source is intentionally retained for rollback. If the
+// destination already exists, it is authoritative and migration is a no-op.
+func MigrateCheckpoint(source, destination string) error {
+	if source == "" || destination == "" || source == destination {
+		return nil
+	}
+	marker := source + ".migrated"
+	if _, err := os.ReadFile(marker); err == nil {
+		// Migration is intentionally one-shot. A different first URL in a
+		// later configuration must start with its own empty checkpoint rather
+		// than inherit the old receiver's delivery position.
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read checkpoint migration marker: %w", err)
+	}
+	if _, err := os.Stat(destination); err == nil {
+		return os.WriteFile(marker, []byte(destination+"\n"), 0640)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat destination checkpoint: %w", err)
+	}
+	data, err := os.ReadFile(source)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read legacy remote_write checkpoint: %w", err)
+	}
+	var c checkpoint
+	if err := json.Unmarshal(data, &c); err != nil {
+		return fmt.Errorf("decode legacy remote_write checkpoint: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0750); err != nil {
+		return fmt.Errorf("create checkpoint directory: %w", err)
+	}
+	f, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0640)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create migrated checkpoint: %w", err)
+	}
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(destination)
+		}
+	}()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write migrated checkpoint: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync migrated checkpoint: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close migrated checkpoint: %w", err)
+	}
+	if err := os.WriteFile(marker, []byte(destination+"\n"), 0640); err != nil {
+		return fmt.Errorf("write checkpoint migration marker: %w", err)
+	}
+	ok = true
+	return nil
+}
+
 func New(cfg Config) (*Sender, error) {
 	if !cfg.Enabled {
 		return nil, nil

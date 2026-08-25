@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/config"
+	"github.com/Yuri666/systemd-transition-exporter/internal/delivery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/engine"
 	"github.com/Yuri666/systemd-transition-exporter/internal/metrics"
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
@@ -179,197 +180,80 @@ func main() {
 		}
 	}
 
-	rw, err := remote_write.New(remote_write.Config{
-		Enabled: cfg.RemoteWrite.Enabled, URL: cfg.RemoteWrite.URL,
-		BatchSize: cfg.RemoteWrite.BatchSize, FlushInterval: cfg.RemoteWrite.FlushInterval,
-		RetryInterval: cfg.RemoteWrite.RetryInterval, Timeout: cfg.RemoteWrite.Timeout,
-		Checkpoint: cfg.RemoteWrite.Checkpoint, StateInterval: cfg.RemoteWrite.StateInterval,
-		Labels: cfg.RemoteWrite.Labels,
-	})
-	if err != nil {
-		_ = httpListener.Close()
-		log.Fatal(err)
+	deliveryStartupEvents := startupRecovered
+	if cfg.WAL.Enabled {
+		events, err := wal.ReadAll(walPath)
+		if err != nil && !os.IsNotExist(err) {
+			_ = httpListener.Close()
+			log.Fatalf("remote_write WAL scan: %v", err)
+		}
+		deliveryStartupEvents = events
 	}
 
-	if rw != nil {
-		reg.SetRemoteWriteStats(rw.Stats())
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					reg.SetRemoteWriteStats(rw.Stats())
-				case <-ctx.Done():
-					reg.SetRemoteWriteStats(rw.Stats())
-					return
-				}
-			}
-		}()
+	type targetRuntime struct {
+		sender *remote_write.Sender
+		worker *delivery.Worker
 	}
-
-	eventQueue := make(chan model.Event, 100000)
-	stateQueue := make(chan model.ServiceState, 10000)
-	if rw != nil {
-		go func() {
-			if cfg.WAL.Enabled {
-				if events, e := wal.ReadAll(walPath); e == nil {
-					split := 0
-					if !startupSlotStart.IsZero() {
-						for split < len(events) && events[split].EventTimeUnixMS < startupSlotStart.UnixMilli() {
-							split++
-						}
-					}
-					if e := rw.Send(ctx, events[:split]); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write WAL recovery stopped: %v", e)
-					}
-					if e := rw.SendRecoveredStates(ctx, startupFill); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write startup fill stopped: %v", e)
-					}
-					if e := rw.Send(ctx, events[split:]); e != nil && ctx.Err() == nil {
-						log.Printf("remote_write recovery stopped: %v", e)
-					}
-				} else if !os.IsNotExist(e) {
-					log.Printf("remote_write WAL scan: %v", e)
-				}
-			} else {
-				if e := rw.SendRecoveredStates(ctx, startupFill); e != nil && ctx.Err() == nil {
-					log.Printf("remote_write startup fill stopped: %v", e)
-				}
-				if e := rw.Send(ctx, startupRecovered); e != nil && ctx.Err() == nil {
-					log.Printf("remote_write startup recovery stopped: %v", e)
-				}
-			}
-
-			batch := make([]model.Event, 0, cfg.RemoteWrite.BatchSize)
-			timer := time.NewTicker(cfg.RemoteWrite.FlushInterval)
-			stateTimer := time.NewTicker(cfg.RemoteWrite.StateInterval)
-			defer timer.Stop()
-			defer stateTimer.Stop()
-			var degradedSince time.Time
-			markDegraded := func() {
-				if degradedSince.IsZero() {
-					degradedSince = time.Now()
-				}
-			}
-			drainEvents := func() {
-				for {
-					select {
-					case e := <-eventQueue:
-						batch = append(batch, e)
-					default:
-						return
-					}
-				}
-			}
-			// flush reports whether the transition backlog is empty afterwards.
-			// Current-state samples must not be published while it is not:
-			// a sample stamped now would make the pending history out of order.
-			flush := func() bool {
-				drainEvents()
-				if len(batch) == 0 {
-					return true
-				}
-				err := rw.Send(ctx, batch)
-				if err == nil {
-					batch = batch[:0]
-					return true
-				}
-				if ctx.Err() != nil {
-					return false
-				}
-				markDegraded()
-				if remote_write.IsPermanent(err) {
-					// Retrying a rejected payload forever would block every
-					// later transition. The events stay durable in the WAL.
-					log.Printf("remote_write rejected %d transition events; dropping them from the send queue: %v", len(batch), err)
-					reg.AddDroppedEvents(len(batch))
-					batch = batch[:0]
-					return true
-				}
-				log.Printf("remote_write send failed: %v", err)
-				return false
-			}
-			// republishSlot restores continuity after a delivery outage. The
-			// receiver missed both transitions and heartbeats, so the current
-			// slot is rebuilt from the journal exactly as on startup.
-			republishSlot := func() bool {
+	targets := make([]targetRuntime, 0, len(cfg.RemoteWrite.Targets))
+	for _, target := range cfg.RemoteWrite.Targets {
+		if err := remote_write.MigrateCheckpoint(target.LegacyCheckpoint, target.Checkpoint); err != nil {
+			_ = httpListener.Close()
+			log.Fatalf("remote_write target=%s checkpoint migration: %v", target.ID, err)
+		}
+		sender, err := remote_write.New(remote_write.Config{
+			Enabled: true, URL: target.URL,
+			BatchSize: cfg.RemoteWrite.BatchSize, FlushInterval: cfg.RemoteWrite.FlushInterval,
+			RetryInterval: cfg.RemoteWrite.RetryInterval, Timeout: cfg.RemoteWrite.Timeout,
+			Checkpoint: target.Checkpoint, StateInterval: cfg.RemoteWrite.StateInterval,
+			Labels: cfg.RemoteWrite.Labels,
+		})
+		if err != nil {
+			_ = httpListener.Close()
+			log.Fatalf("remote_write target=%s: %v", target.ID, err)
+		}
+		worker := delivery.New(delivery.Config{
+			TargetID:      target.ID,
+			BatchSize:     cfg.RemoteWrite.BatchSize,
+			FlushInterval: cfg.RemoteWrite.FlushInterval,
+			StateInterval: cfg.RemoteWrite.StateInterval,
+			Services:      cfg.Services,
+			StartupEvents: deliveryStartupEvents,
+			StartupFill:   startupFill,
+			StartupSlot:   startupSlotStart,
+			CurrentState:  eng.State,
+			BuildSlotFill: func(ctx context.Context) ([]model.StateSample, error) {
 				windowStart, windowEnd, ok := recovery.RecoveryWindow(time.Now(), cfg.RemoteWrite.RecoveryWindow)
 				if !ok {
-					return true
+					return nil, nil
 				}
 				events, err := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd)
 				if err != nil {
-					log.Printf("remote_write recovery republish: journal read failed: %v", err)
-					return false
+					return nil, err
 				}
-				fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
-				if err != nil {
-					log.Printf("remote_write recovery republish: state fill failed: %v", err)
-					return false
-				}
-				if err := rw.SendRecoveredStates(ctx, fill); err != nil {
-					log.Printf("remote_write recovery republish: send failed: %v", err)
-					return false
-				}
-				log.Printf("remote_write delivery recovered: republished slot=%s..%s transitions=%d samples=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), len(events), len(fill))
-				return true
-			}
-			sendCurrentStates := func(states []model.ServiceState) {
-				if len(states) == 0 {
-					return
-				}
-				if e := rw.SendCurrentStates(ctx, states); e != nil && ctx.Err() == nil {
-					markDegraded()
-					log.Printf("remote_write current state failed: %v", e)
+				return recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
+			},
+			OnDropped: reg.AddDroppedEvents,
+		}, sender)
+		targets = append(targets, targetRuntime{sender: sender, worker: worker})
+		reg.SetRemoteWriteStats(target.ID, sender.Stats())
+		log.Printf("remote_write target=%s url=%s checkpoint=%s", target.ID, target.URL, target.Checkpoint)
+		go worker.Run(ctx)
+	}
+	if len(targets) > 0 {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			update := func() {
+				for _, target := range targets {
+					reg.SetRemoteWriteStats(target.worker.TargetID(), target.sender.Stats())
 				}
 			}
-
 			for {
-				// Disabled while a backlog exists so that history is always
-				// delivered before anything stamped with the current time.
-				var readyStates <-chan model.ServiceState
-				if len(batch) == 0 {
-					readyStates = stateQueue
-				}
 				select {
-				case e := <-eventQueue:
-					batch = append(batch, e)
-					if len(batch) >= cfg.RemoteWrite.BatchSize {
-						flush()
-					}
-				case state := <-readyStates:
-					if !flush() {
-						select {
-						case stateQueue <- state:
-						default:
-						}
-						continue
-					}
-					sendCurrentStates([]model.ServiceState{state})
-				case <-timer.C:
-					flush()
-				case <-stateTimer.C:
-					if !flush() {
-						continue
-					}
-					if !degradedSince.IsZero() {
-						// A shorter outage cannot have produced a gap, because
-						// no heartbeat was missed while it lasted.
-						if time.Since(degradedSince) < cfg.RemoteWrite.StateInterval || republishSlot() {
-							degradedSince = time.Time{}
-						}
-					}
-					states := make([]model.ServiceState, 0, len(cfg.Services))
-					for _, service := range cfg.Services {
-						if st, ok := eng.State(service); ok {
-							states = append(states, st)
-						}
-					}
-					sendCurrentStates(states)
+				case <-ticker.C:
+					update()
 				case <-ctx.Done():
-					drainEvents()
-					flush()
+					update()
 					return
 				}
 			}
@@ -382,11 +266,11 @@ func main() {
 				return err
 			}
 		}
-		if enqueue && rw != nil {
-			select {
-			case eventQueue <- event:
-			default:
-				log.Printf("remote_write queue full; event seq=%d remains durable in WAL", event.Sequence)
+		if enqueue {
+			for _, target := range targets {
+				if !target.worker.EnqueueEvent(event) {
+					log.Printf("remote_write target=%s queue full; event seq=%d remains durable in WAL", target.worker.TargetID(), event.Sequence)
+				}
 			}
 		}
 		return nil
@@ -411,11 +295,9 @@ func main() {
 			}
 		}
 		reg.SetState(s.Service, state.Availability)
-		if rw != nil {
-			select {
-			case stateQueue <- state:
-			default:
-				log.Printf("remote_write state queue full; startup state for %s will be sent at next state_interval", s.Service)
+		for _, target := range targets {
+			if !target.worker.EnqueueState(state) {
+				log.Printf("remote_write target=%s state queue full; state for %s will be sent at next state_interval", target.worker.TargetID(), s.Service)
 			}
 		}
 		return nil
@@ -452,18 +334,15 @@ func main() {
 			}
 		}
 
-		if rw != nil {
+		if len(targets) > 0 {
 			fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
 			if err != nil {
 				return err
 			}
-			// A rejected continuity sample must not discard the recovered
-			// transitions: the transitions are the authoritative history.
-			if err := rw.SendRecoveredStates(ctx, fill); err != nil {
-				log.Printf("recovery state fill failed: %v", err)
-			}
-			if err := rw.Send(ctx, recovered); err != nil {
-				return err
+			for _, target := range targets {
+				if !target.worker.EnqueueRecovery(fill, recovered) {
+					log.Printf("remote_write target=%s queue full; recovery remains durable in WAL", target.worker.TargetID())
+				}
 			}
 			if len(fill) > 0 {
 				log.Printf("recovery state fill slot=%s..%s interval=%s samples=%d", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), cfg.RemoteWrite.RecoveryFillInterval, len(fill))

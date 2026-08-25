@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
+	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
 )
 
 func TestHandlerDoesNotExposeRemoteWriteServiceSeries(t *testing.T) {
@@ -84,5 +85,26 @@ func TestRecoveryMetricsExposeOnlyExcludedPartBeforeSlot(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "systemd_transition_exporter_recovery_uncovered_seconds 780") {
 		t.Fatalf("unexpected uncovered recovery metric:\n%s", body)
+	}
+}
+
+func TestRemoteWriteMetricsAreSeparatedByTarget(t *testing.T) {
+	r := New()
+	r.SetRemoteWriteStats("aaaa1111", remote_write.Stats{SuccessfulRequests: 3})
+	r.SetRemoteWriteStats("bbbb2222", remote_write.Stats{SuccessfulRequests: 7})
+	r.AddDroppedEvents("bbbb2222", 2)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.Handler(w, req)
+	body := w.Body.String()
+	for _, want := range []string{
+		`systemd_transition_exporter_remote_write_successful_requests_total{target="aaaa1111"} 3`,
+		`systemd_transition_exporter_remote_write_successful_requests_total{target="bbbb2222"} 7`,
+		`systemd_transition_exporter_remote_write_dropped_events_total{target="bbbb2222"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics does not contain %q:\n%s", want, body)
+		}
 	}
 }

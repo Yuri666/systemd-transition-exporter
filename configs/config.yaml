@@ -24,11 +24,16 @@ wal:
 
 remote_write:
   enabled: false
-  url: "http://127.0.0.1:9090/api/v1/write"
+  # Every URL has an independent delivery worker, retry state and checkpoint.
+  # A failure of one receiver does not delay the others.
+  urls:
+    - "http://127.0.0.1:9090/api/v1/write"
+    # - "http://prometheus-dr:9090/api/v1/write"
   batch_size: 100
   flush_interval: 1s
   retry_interval: 1s
   timeout: 10s
+  # Base path. Multi-target checkpoints use a stable URL-hash suffix.
   checkpoint: /var/lib/systemd-transition-exporter/remote_write.checkpoint
 
   # Current state heartbeat. Keep this comfortably below Prometheus's

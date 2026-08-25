@@ -1,8 +1,10 @@
 package config
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -31,17 +33,26 @@ type WALConfig struct {
 	Fsync     bool   `yaml:"fsync"`
 }
 type RemoteWriteConfig struct {
-	Enabled              bool              `yaml:"enabled"`
-	URL                  string            `yaml:"url"`
-	BatchSize            int               `yaml:"batch_size"`
-	FlushInterval        time.Duration     `yaml:"flush_interval"`
-	RetryInterval        time.Duration     `yaml:"retry_interval"`
-	Timeout              time.Duration     `yaml:"timeout"`
-	Checkpoint           string            `yaml:"checkpoint"`
-	StateInterval        time.Duration     `yaml:"state_interval"`
-	RecoveryFillInterval time.Duration     `yaml:"recovery_fill_interval"`
-	RecoveryWindow       time.Duration     `yaml:"recovery_window"`
-	Labels               map[string]string `yaml:"labels"`
+	Enabled              bool                `yaml:"enabled"`
+	URL                  string              `yaml:"url"`
+	URLs                 []string            `yaml:"urls"`
+	BatchSize            int                 `yaml:"batch_size"`
+	FlushInterval        time.Duration       `yaml:"flush_interval"`
+	RetryInterval        time.Duration       `yaml:"retry_interval"`
+	Timeout              time.Duration       `yaml:"timeout"`
+	Checkpoint           string              `yaml:"checkpoint"`
+	StateInterval        time.Duration       `yaml:"state_interval"`
+	RecoveryFillInterval time.Duration       `yaml:"recovery_fill_interval"`
+	RecoveryWindow       time.Duration       `yaml:"recovery_window"`
+	Labels               map[string]string   `yaml:"labels"`
+	Targets              []RemoteWriteTarget `yaml:"-"`
+}
+
+type RemoteWriteTarget struct {
+	ID               string
+	URL              string
+	Checkpoint       string
+	LegacyCheckpoint string
 }
 
 func Load(path string) (Config, error) {
@@ -68,9 +79,26 @@ func Load(path string) (Config, error) {
 	if len(c.Services) == 0 {
 		return Config{}, fmt.Errorf("services must contain at least one systemd unit")
 	}
+	// Recovery also protects D-Bus reconnects and host-reboot handling, so its
+	// slot size must be valid even when Remote Write delivery is disabled.
+	if c.RemoteWrite.RecoveryFillInterval <= 0 {
+		c.RemoteWrite.RecoveryFillInterval = time.Minute
+	}
+	if c.RemoteWrite.RecoveryWindow <= 0 {
+		c.RemoteWrite.RecoveryWindow = 15 * time.Minute
+	}
 	if c.RemoteWrite.Enabled {
-		if c.RemoteWrite.URL == "" {
-			return Config{}, fmt.Errorf("remote_write.url must be set when remote_write.enabled=true")
+		if c.RemoteWrite.URL != "" && len(c.RemoteWrite.URLs) > 0 {
+			return Config{}, fmt.Errorf("remote_write.url and remote_write.urls cannot be used together")
+		}
+		urls := c.RemoteWrite.URLs
+		legacy := false
+		if len(urls) == 0 && c.RemoteWrite.URL != "" {
+			urls = []string{c.RemoteWrite.URL}
+			legacy = true
+		}
+		if len(urls) == 0 {
+			return Config{}, fmt.Errorf("remote_write.url or remote_write.urls must be set when remote_write.enabled=true")
 		}
 		if c.RemoteWrite.BatchSize <= 0 {
 			c.RemoteWrite.BatchSize = 100
@@ -87,14 +115,35 @@ func Load(path string) (Config, error) {
 		if c.RemoteWrite.Checkpoint == "" {
 			c.RemoteWrite.Checkpoint = "/var/lib/systemd-transition-exporter/remote_write.checkpoint"
 		}
+		seenURLs := make(map[string]struct{}, len(urls))
+		for i, rawURL := range urls {
+			url := strings.TrimSpace(rawURL)
+			if url == "" {
+				return Config{}, fmt.Errorf("remote_write.urls[%d] must not be empty", i)
+			}
+			if _, ok := seenURLs[url]; ok {
+				return Config{}, fmt.Errorf("remote_write contains duplicate URL %q", url)
+			}
+			seenURLs[url] = struct{}{}
+			sum := sha256.Sum256([]byte(url))
+			id := fmt.Sprintf("%x", sum[:6])
+			checkpoint := c.RemoteWrite.Checkpoint
+			legacyCheckpoint := ""
+			if !legacy {
+				checkpoint += "." + id
+				if i == 0 {
+					legacyCheckpoint = c.RemoteWrite.Checkpoint
+				}
+			}
+			c.RemoteWrite.Targets = append(c.RemoteWrite.Targets, RemoteWriteTarget{
+				ID:               id,
+				URL:              url,
+				Checkpoint:       checkpoint,
+				LegacyCheckpoint: legacyCheckpoint,
+			})
+		}
 		if c.RemoteWrite.StateInterval <= 0 {
 			c.RemoteWrite.StateInterval = time.Minute
-		}
-		if c.RemoteWrite.RecoveryFillInterval <= 0 {
-			c.RemoteWrite.RecoveryFillInterval = time.Minute
-		}
-		if c.RemoteWrite.RecoveryWindow <= 0 {
-			c.RemoteWrite.RecoveryWindow = 15 * time.Minute
 		}
 		// Prometheus drops a series from instant queries after its lookback
 		// delta, which defaults to 5 minutes. A recovered slot must therefore

@@ -178,7 +178,9 @@ wal:
 
 remote_write:
   enabled: false
-  url: "http://127.0.0.1:9090/api/v1/write"
+  urls:
+    - "http://prometheus-a:9090/api/v1/write"
+    - "http://prometheus-b:9090/api/v1/write"
   batch_size: 100
   flush_interval: 1s
   retry_interval: 1s
@@ -199,18 +201,40 @@ remote_write:
 
 ## Remote Write
 
-Set `remote_write.enabled: true` to send service state samples to a Prometheus Remote Write receiver:
+Set `remote_write.enabled: true` and list one or more receivers to send service
+state samples through Remote Write:
 
 ```yaml
 remote_write:
   enabled: true
-  url: "http://prometheus:9090/api/v1/write"
+  urls:
+    - "http://prometheus-a:9090/api/v1/write"
+    - "http://prometheus-b:9090/api/v1/write"
 ```
 
-The destination Prometheus must have the Remote Write receiver enabled, for example with:
+Every URL gets its own worker, in-memory queue, retry state, heartbeat schedule
+and durable checkpoint. Delivery is a broadcast: every transition is sent to
+every receiver, while a slow or unavailable receiver cannot block healthy
+ones. All other `remote_write` settings and static labels are shared.
+
+The legacy single-receiver form remains supported without changing its
+checkpoint:
+
+```yaml
+remote_write:
+  enabled: true
+  url: "http://prometheus-a:9090/api/v1/write"
+```
+
+Do not configure `url` and `urls` together. When converting an existing
+single-receiver installation to `urls`, put the existing receiver first. Its
+legacy checkpoint is copied once to the new URL-specific checkpoint; later URL
+reordering is safe because checkpoint names use a stable URL hash.
+
+Each destination Prometheus must have the Remote Write receiver enabled:
 
 ```text
---enable-feature=remote-write-receiver
+--web.enable-remote-write-receiver
 ```
 
 ### Metrics sent through Remote Write
@@ -233,7 +257,9 @@ Its semantics are:
 
 The same `systemd_service_state` metric is also used for the current-state heartbeat. Heartbeat samples use the current exporter time and do not advance the transition checkpoint.
 
-The sender retries failed delivery and maintains a durable checkpoint of the last successfully delivered transition sequence. A successful HTTP `2xx` response advances the checkpoint; failed requests do not.
+Each sender retries failed delivery and maintains its own durable checkpoint of
+the last successfully delivered transition sequence. A successful HTTP `2xx`
+response advances only that receiver's checkpoint; failed requests do not.
 
 ### Required Prometheus receiver setup
 
@@ -244,7 +270,8 @@ a command line flag:
 prometheus --web.enable-remote-write-receiver
 ```
 
-which makes `POST /api/v1/write` available, so `remote_write.url` is normally
+which makes `POST /api/v1/write` available, so each entry in
+`remote_write.urls` is normally
 `http://<prometheus>:9090/api/v1/write`.
 
 Out-of-order ingestion, in contrast, is **not** a command line flag; it is a
@@ -301,8 +328,8 @@ first, and the present state only afterwards.
 
 ## Remote Write outage
 
-A destination outage is handled like a collector outage, because the receiver
-missed both transitions and heartbeats:
+A destination outage is handled independently like a collector outage for that
+receiver, because it missed both transitions and heartbeats:
 
 - transitions accumulate in the durable WAL and in the send queue, and no
   current-time sample is published while they are pending;
@@ -318,6 +345,10 @@ missed both transitions and heartbeats:
   `systemd_transition_exporter_remote_write_dropped_events_total` is increased.
   A growing counter almost always means the receiver accepts no out-of-order
   samples, or accepts a window smaller than one recovery slot.
+
+Other configured receivers continue receiving transitions and heartbeats
+during the outage. Recovery, ordering and checkpoint advancement are maintained
+separately for each target.
 
 ## Prometheus metrics (`/metrics`)
 
@@ -364,15 +395,15 @@ These metrics are **only exporter diagnostics exposed by `/metrics`**. They are 
 ```text
 # HELP systemd_transition_exporter_remote_write_successful_requests_total Total number of successful Remote Write HTTP requests.
 # TYPE systemd_transition_exporter_remote_write_successful_requests_total counter
-systemd_transition_exporter_remote_write_successful_requests_total 10
+systemd_transition_exporter_remote_write_successful_requests_total{target="8bf3a21c54d0"} 10
 ```
 
-**`systemd_transition_exporter_remote_write_successful_requests_total`** — number of Remote Write HTTP requests completed with a `2xx` response.
+**`systemd_transition_exporter_remote_write_successful_requests_total`** — number of Remote Write HTTP requests completed with a `2xx` response for each target.
 
 ```text
 # HELP systemd_transition_exporter_remote_write_failed_requests_total Total number of failed Remote Write HTTP requests or rejected requests.
 # TYPE systemd_transition_exporter_remote_write_failed_requests_total counter
-systemd_transition_exporter_remote_write_failed_requests_total 2
+systemd_transition_exporter_remote_write_failed_requests_total{target="8bf3a21c54d0"} 2
 ```
 
 **`systemd_transition_exporter_remote_write_failed_requests_total`** — number of failed, rejected, or otherwise unsuccessful Remote Write attempts. This can include attempts that are subsequently retried.
@@ -380,7 +411,7 @@ systemd_transition_exporter_remote_write_failed_requests_total 2
 ```text
 # HELP systemd_transition_exporter_remote_write_retries_total Total number of Remote Write retry attempts.
 # TYPE systemd_transition_exporter_remote_write_retries_total counter
-systemd_transition_exporter_remote_write_retries_total 2
+systemd_transition_exporter_remote_write_retries_total{target="8bf3a21c54d0"} 2
 ```
 
 **`systemd_transition_exporter_remote_write_retries_total`** — number of retry attempts made after a failed Remote Write request.
@@ -388,7 +419,7 @@ systemd_transition_exporter_remote_write_retries_total 2
 ```text
 # HELP systemd_transition_exporter_remote_write_samples_sent_total Total number of samples accepted by the Remote Write endpoint in successful requests.
 # TYPE systemd_transition_exporter_remote_write_samples_sent_total counter
-systemd_transition_exporter_remote_write_samples_sent_total 123
+systemd_transition_exporter_remote_write_samples_sent_total{target="8bf3a21c54d0"} 123
 ```
 
 **`systemd_transition_exporter_remote_write_samples_sent_total`** — total number of samples contained in successfully accepted Remote Write requests. It counts samples, not unique transitions.
@@ -396,10 +427,14 @@ systemd_transition_exporter_remote_write_samples_sent_total 123
 ```text
 # HELP systemd_transition_exporter_remote_write_dropped_events_total Total number of transition events dropped after a permanent Remote Write rejection.
 # TYPE systemd_transition_exporter_remote_write_dropped_events_total counter
-systemd_transition_exporter_remote_write_dropped_events_total 0
+systemd_transition_exporter_remote_write_dropped_events_total{target="8bf3a21c54d0"} 0
 ```
 
-**`systemd_transition_exporter_remote_write_dropped_events_total`** — transition events removed from the send queue after the receiver rejected them with HTTP `4xx`. They stay in the WAL. Any non-zero value means transition history did not reach Prometheus, usually because the out-of-order window is too small.
+**`systemd_transition_exporter_remote_write_dropped_events_total`** — transition events removed from a target's send queue after that receiver rejected them with HTTP `4xx`. They stay in the WAL. Any non-zero value means transition history did not reach that target, usually because the out-of-order window is too small.
+
+The `target` label is the stable first 12 hexadecimal characters of the URL
+SHA-256 hash. The exporter logs the target-to-URL mapping at startup without
+putting full receiver URLs into every diagnostic metric.
 
 ### Important distinction
 
@@ -568,9 +603,17 @@ The latest observed service state is stored separately in:
 /var/lib/systemd-transition-exporter/wal/state.json
 ```
 
-The WAL provides durable storage of events already detected by the collector and replay on startup. Remote Write has a separate delivery checkpoint. Heartbeat samples do not advance the transition checkpoint.
+The WAL provides durable storage of events already detected by the collector
+and replay on startup. Each Remote Write target has a separate delivery
+checkpoint named from the configured checkpoint base plus its stable target ID,
+for example `remote_write.checkpoint.8bf3a21c54d0`. Heartbeat samples do not
+advance transition checkpoints.
 
-Remote Write is deliberately **at-least-once**. The checkpoint advances only after the receiver returns `2xx` and the checkpoint file has been durably persisted. A crash in the narrow interval after receiver acceptance but before checkpoint persistence can cause a sample to be sent again after restart.
+Remote Write is deliberately **at-least-once per target**. A target checkpoint
+advances only after that receiver returns `2xx` and the checkpoint file has
+been durably persisted. A crash in the narrow interval after receiver
+acceptance but before checkpoint persistence can cause a sample to be sent
+again to that receiver after restart.
 
 ## Debug endpoint
 

@@ -3,6 +3,7 @@ package metrics
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,8 +23,8 @@ type Registry struct {
 	dbusLastChangeMS   int64
 	dbusDisconnectedAt time.Time
 
-	remoteWrite        remote_write.Stats
-	remoteWriteDropped uint64
+	remoteWrite        map[string]remote_write.Stats
+	remoteWriteDropped map[string]uint64
 
 	recoveryAttempts    uint64
 	recoverySlotStartMS int64
@@ -33,9 +34,11 @@ type Registry struct {
 
 func New() *Registry {
 	return &Registry{
-		states: make(map[string]model.AvailabilityState),
-		up:     make(map[string]uint64),
-		down:   make(map[string]uint64),
+		states:             make(map[string]model.AvailabilityState),
+		up:                 make(map[string]uint64),
+		down:               make(map[string]uint64),
+		remoteWrite:        make(map[string]remote_write.Stats),
+		remoteWriteDropped: make(map[string]uint64),
 	}
 }
 
@@ -94,22 +97,28 @@ func (r *Registry) SetDBusConnected(connected bool, at time.Time) {
 // SetRemoteWriteStats publishes a snapshot of the Remote Write delivery
 // counters. It is intentionally a snapshot: the sender remains independent
 // from the Prometheus exposition path.
-func (r *Registry) SetRemoteWriteStats(stats remote_write.Stats) {
+func (r *Registry) SetRemoteWriteStats(target string, stats remote_write.Stats) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.remoteWrite = stats
+	if r.remoteWrite == nil {
+		r.remoteWrite = make(map[string]remote_write.Stats)
+	}
+	r.remoteWrite[target] = stats
 }
 
 // AddDroppedEvents counts transition events the receiver rejected permanently.
 // They stay in the WAL, so the counter shows how much history never reached
 // Prometheus, usually because the out-of-order window was too small.
-func (r *Registry) AddDroppedEvents(n int) {
+func (r *Registry) AddDroppedEvents(target string, n int) {
 	if n <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.remoteWriteDropped += uint64(n)
+	if r.remoteWriteDropped == nil {
+		r.remoteWriteDropped = make(map[string]uint64)
+	}
+	r.remoteWriteDropped[target] += uint64(n)
 }
 
 // RecordRecovery records the aligned slot selected for journal recovery.
@@ -163,23 +172,38 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_successful_requests_total Total number of successful Remote Write HTTP requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_successful_requests_total counter")
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_successful_requests_total %d\n", r.remoteWrite.SuccessfulRequests)
+	targets := make([]string, 0, len(r.remoteWrite))
+	for target := range r.remoteWrite {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+	for _, target := range targets {
+		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_successful_requests_total{target=%q} %d\n", target, r.remoteWrite[target].SuccessfulRequests)
+	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_failed_requests_total Total number of failed Remote Write HTTP requests or rejected requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_failed_requests_total counter")
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_failed_requests_total %d\n", r.remoteWrite.FailedRequests)
+	for _, target := range targets {
+		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_failed_requests_total{target=%q} %d\n", target, r.remoteWrite[target].FailedRequests)
+	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_retries_total Total number of Remote Write retry attempts.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_retries_total counter")
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_retries_total %d\n", r.remoteWrite.Retries)
+	for _, target := range targets {
+		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_retries_total{target=%q} %d\n", target, r.remoteWrite[target].Retries)
+	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_samples_sent_total Total number of samples accepted by the Remote Write endpoint in successful requests.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_samples_sent_total counter")
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_samples_sent_total %d\n", r.remoteWrite.SentSamples)
+	for _, target := range targets {
+		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_samples_sent_total{target=%q} %d\n", target, r.remoteWrite[target].SentSamples)
+	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_dropped_events_total Total number of transition events dropped after a permanent Remote Write rejection.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_dropped_events_total counter")
-	fmt.Fprintf(w, "systemd_transition_exporter_remote_write_dropped_events_total %d\n", r.remoteWriteDropped)
+	for _, target := range targets {
+		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_dropped_events_total{target=%q} %d\n", target, r.remoteWriteDropped[target])
+	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_recovery_attempts_total Total number of aligned journal recovery slots attempted.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_recovery_attempts_total counter")
