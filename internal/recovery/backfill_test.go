@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"context"
 	"sort"
 	"testing"
 	"time"
@@ -92,6 +93,61 @@ func TestStateFillKeepsExactTransitionTimestamps(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("exact transition timestamp %d is missing from the recovered slot", down.UnixMilli())
+	}
+}
+
+func TestSlotStartStateUsesCurrentStateWhenSlotHasNoTransition(t *testing.T) {
+	start := time.Date(2026, 8, 27, 14, 30, 0, 0, time.Local)
+	current := map[string]model.AvailabilityState{"cups.service": model.StateUp}
+
+	state, err := slotStartState(context.Background(), "cups.service", start, nil, current)
+	if err != nil {
+		t.Fatalf("slotStartState: %v", err)
+	}
+	if state != model.StateUp {
+		t.Fatalf("slot start state = %s, want up", state)
+	}
+}
+
+func TestSlotStartStateIsTheInverseOfTheFirstTransition(t *testing.T) {
+	start := time.Date(2026, 8, 27, 14, 30, 0, 0, time.Local)
+	for _, tc := range []struct {
+		first model.AvailabilityState
+		want  model.AvailabilityState
+	}{
+		{first: model.StateUp, want: model.StateDown},
+		{first: model.StateDown, want: model.StateUp},
+	} {
+		events := []model.Event{{Service: "cups.service", State: tc.first, EventTimeUnixMS: start.Add(time.Minute).UnixMilli()}}
+		state, err := slotStartState(context.Background(), "cups.service", start, events, nil)
+		if err != nil {
+			t.Fatalf("slotStartState: %v", err)
+		}
+		if state != tc.want {
+			t.Fatalf("first transition %s produced slot start state %s, want %s", tc.first, state, tc.want)
+		}
+	}
+}
+
+func TestStateFillKeepsLongRunningServiceUpOnFirstStart(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 8, 27, 14, 30, 0, 0, loc)
+	end := start.Add(8 * time.Minute)
+
+	// A first start with an empty WAL: the unit has been active since long
+	// before the slot, so the journal holds no lifecycle record inside it.
+	current := map[string]model.AvailabilityState{"cups.service": model.StateUp}
+	samples, err := BuildStateFill(context.Background(), []string{"cups.service"}, start, end, nil, time.Minute, current)
+	if err != nil {
+		t.Fatalf("BuildStateFill: %v", err)
+	}
+	if len(samples) == 0 {
+		t.Fatal("slot produced no continuity samples")
+	}
+	for _, sample := range samples {
+		if sample.State != model.StateUp {
+			t.Fatalf("sample at %d is %s, want up for the whole slot", sample.TimestampUnixMS, sample.State)
+		}
 	}
 }
 

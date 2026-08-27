@@ -140,6 +140,13 @@ func main() {
 		}
 		startupObservedFrom = time.UnixMilli(newest)
 	}
+	// The monitor is not running yet, so the slot baseline for a first start
+	// with an empty WAL can only come from systemd itself.
+	startupStates, err := systemd.CurrentStates(ctx, cfg.Services)
+	if err != nil {
+		log.Printf("read current unit states for the recovery baseline: %v", err)
+	}
+
 	var startupFill []model.StateSample
 	var startupRecovered []model.Event
 	var startupSlotStart time.Time
@@ -171,7 +178,7 @@ func main() {
 					log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 				}
 			}
-			if fill, e := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval); e != nil {
+			if fill, e := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, startupStates); e != nil {
 				log.Printf("startup recovery fill failed: %v", e)
 			} else {
 				startupFill = fill
@@ -188,6 +195,18 @@ func main() {
 			log.Fatalf("remote_write WAL scan: %v", err)
 		}
 		deliveryStartupEvents = events
+	}
+
+	// Once the monitor is running the engine holds the authoritative current
+	// state, which anchors the beginning of every republished slot.
+	engineStates := func() map[string]model.AvailabilityState {
+		states := make(map[string]model.AvailabilityState, len(cfg.Services))
+		for _, service := range cfg.Services {
+			if state, ok := eng.State(service); ok {
+				states[service] = state.Availability
+			}
+		}
+		return states
 	}
 
 	type targetRuntime struct {
@@ -230,7 +249,7 @@ func main() {
 				if err != nil {
 					return nil, err
 				}
-				return recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
+				return recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, engineStates())
 			},
 			OnDropped: reg.AddDroppedEvents,
 		}, sender)
@@ -335,7 +354,7 @@ func main() {
 		}
 
 		if len(targets) > 0 {
-			fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval)
+			fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, engineStates())
 			if err != nil {
 				return err
 			}
@@ -395,8 +414,5 @@ func main() {
 }
 
 func currentState(active string) model.AvailabilityState {
-	if active == "active" {
-		return model.StateUp
-	}
-	return model.StateDown
+	return model.AvailabilityFromActiveState(active)
 }

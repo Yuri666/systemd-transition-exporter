@@ -31,6 +31,15 @@ func (s AvailabilityState) String() string {
 	}
 }
 
+// AvailabilityFromActiveState maps systemd's ActiveState to the exporter's
+// binary availability. Only "active" counts as UP.
+func AvailabilityFromActiveState(active string) AvailabilityState {
+	if strings.TrimSpace(active) == "active" {
+		return StateUp
+	}
+	return StateDown
+}
+
 type EventSource uint8
 
 const (

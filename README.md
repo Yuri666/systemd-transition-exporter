@@ -535,11 +535,19 @@ Systemd unit properties are not a complete historical event log. Therefore trans
 
 Recovery is deliberately limited to the current local-time slot. With the
 default `remote_write.recovery_window: 15m`, an exporter becoming ready at
-`15:14` reads transition events only from `[15:00, 15:14)`. It queries the
-single latest lifecycle event before `15:00` to establish the state at the slot
-start. An outage beginning at `14:47` does not cause the closed `14:45..15:00`
-slot to be rewritten; the excluded 13 minutes are exposed as
+`15:14` reads transition events only from `[15:00, 15:14)`. An outage beginning
+at `14:47` does not cause the closed `14:45..15:00` slot to be rewritten; the
+excluded 13 minutes are exposed as
 `systemd_transition_exporter_recovery_uncovered_seconds`.
+
+The state at the slot start is not guessed. systemd reports a start only for a
+unit that was not active, so the state preceding the first recovered transition
+is that transition inverted. When the slot contains no transition at all, the
+state cannot have changed during it and the currently observed state applies to
+the whole slot — on a first start with an empty WAL that state is read from
+systemd before monitoring begins. Only when the current state is unavailable
+does the exporter fall back to the latest lifecycle event before the slot, and a
+unit with no lifecycle record at all is reported as down.
 
 The recovered slot is then **republished as samples**, not left to
 interpolation. Prometheus removes a series from instant queries once no sample

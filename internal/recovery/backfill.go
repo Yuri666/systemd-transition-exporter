@@ -40,11 +40,10 @@ func RecoveryWindow(ready time.Time, size time.Duration) (time.Time, time.Time, 
 // and at every recovered transition, so the slot is continuous while transitions
 // keep their exact timestamps.
 //
-// The state at the slot start comes from the latest journal transition strictly
-// before the slot. A configured service with no lifecycle history is DOWN.
-// Nothing before the slot start is ever generated: that interval is reported as
-// uncovered instead.
-func BuildStateFill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration) ([]model.StateSample, error) {
+// The state at the slot start is derived from the recovered transitions and
+// the currently observed state; see slotStartState. Nothing before the slot
+// start is ever generated: that interval is reported as uncovered instead.
+func BuildStateFill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration, current map[string]model.AvailabilityState) ([]model.StateSample, error) {
 	if interval <= 0 || !end.After(start) {
 		return nil, nil
 	}
@@ -63,18 +62,12 @@ func BuildStateFill(ctx context.Context, services []string, start, end time.Time
 
 	var out []model.StateSample
 	for _, service := range services {
-		state, ok, err := previousState(ctx, service, start)
+		serviceEvents := byService[service]
+		state, err := slotStartState(ctx, service, start, serviceEvents, current)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			// The service is explicitly configured but has no lifecycle event
-			// in the journal. Its Prometheus availability state is therefore
-			// down until systemd reports a successful start.
-			state = model.StateDown
-		}
 
-		serviceEvents := byService[service]
 		eventIndex := 0
 		for ts := start; ts.Before(end); ts = ts.Add(interval) {
 			for eventIndex < len(serviceEvents) && serviceEvents[eventIndex].EventTimeUnixMS <= ts.UnixMilli() {
@@ -97,6 +90,39 @@ func BuildStateFill(ctx context.Context, services []string, start, end time.Time
 		return out[i].TimestampUnixMS < out[j].TimestampUnixMS
 	})
 	return out, nil
+}
+
+// slotStartState determines the availability at the beginning of the slot.
+// systemd reports a start only for a unit that was not active, so the state
+// preceding the first transition inside the slot is that transition inverted.
+// Without any transition the state cannot have changed during the slot, which
+// makes the currently observed state authoritative. This matters most on a
+// first start with an empty WAL: a unit running since long before the slot has
+// no lifecycle record to find, and assuming DOWN would backfill the slot with
+// zeros for a service that was up the whole time. The journal is consulted only
+// when the current state is unknown.
+func slotStartState(ctx context.Context, service string, start time.Time, events []model.Event, current map[string]model.AvailabilityState) (model.AvailabilityState, error) {
+	if len(events) > 0 {
+		return invertState(events[0].State), nil
+	}
+	if state, ok := current[service]; ok && state != model.StateUnknown {
+		return state, nil
+	}
+	state, found, err := previousState(ctx, service, start)
+	if err != nil {
+		return model.StateUnknown, err
+	}
+	if !found {
+		return model.StateDown, nil
+	}
+	return state, nil
+}
+
+func invertState(state model.AvailabilityState) model.AvailabilityState {
+	if state == model.StateUp {
+		return model.StateDown
+	}
+	return model.StateUp
 }
 
 func previousState(ctx context.Context, service string, at time.Time) (model.AvailabilityState, bool, error) {
@@ -144,10 +170,17 @@ func previousState(ctx context.Context, service string, at time.Time) (model.Ava
 	}
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return model.StateUnknown, false, err
 	}
-	if err := cmd.Wait(); err != nil {
-		return model.StateUnknown, false, err
+	waitErr := cmd.Wait()
+	if found {
+		return foundState, true, nil
 	}
-	return foundState, found, nil
+	// journalctl exits with 1 when the filter matches nothing, which for a
+	// baseline lookup only means the unit has no earlier lifecycle record.
+	if waitErr != nil && exitCode(waitErr) != 1 {
+		return model.StateUnknown, false, waitErr
+	}
+	return model.StateUnknown, false, nil
 }

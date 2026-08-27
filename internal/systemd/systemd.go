@@ -65,6 +65,31 @@ func BootTime() (time.Time, error) {
 	return time.Now().Add(-time.Duration(sec * float64(time.Second))), nil
 }
 
+// CurrentStates reports the present availability of the configured units. The
+// startup recovery slot is built before the monitor runs, so without this a
+// freshly installed exporter with an empty WAL would have no authoritative
+// state for the beginning of the slot.
+func CurrentStates(ctx context.Context, services []string) (map[string]model.AvailabilityState, error) {
+	d, err := Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	states := make(map[string]model.AvailabilityState, len(services))
+	for _, service := range services {
+		unit, err := d.LoadUnit(service)
+		if err != nil {
+			return nil, err
+		}
+		snapshot, err := unit.Snapshot("")
+		if err != nil {
+			return nil, err
+		}
+		states[service] = model.AvailabilityFromActiveState(snapshot.ActiveState)
+	}
+	return states, nil
+}
+
 type Unit struct {
 	conn    *dbus.Conn
 	path    dbus.ObjectPath
