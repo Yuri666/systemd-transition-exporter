@@ -40,8 +40,11 @@ func TestConfiguredLabelsAreIncludedInRemoteWrite(t *testing.T) {
 		for _, label := range wr.Timeseries[0].Labels {
 			labels[label.Name] = label.Value
 		}
-		if labels["service"] != "cups.service" {
-			t.Errorf("service label = %q, want cups.service", labels["service"])
+		if labels["name"] != "cups.service" {
+			t.Errorf("name label = %q, want cups.service", labels["name"])
+		}
+		if _, ok := labels["service"]; ok {
+			t.Errorf("unexpected service label %q; unit identifier must use name", labels["service"])
 		}
 		if labels["site"] != "test" {
 			t.Errorf("site label = %q, want test", labels["site"])

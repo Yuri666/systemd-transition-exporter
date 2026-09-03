@@ -288,10 +288,10 @@ func (s *Sender) SendCurrentStates(ctx context.Context, states []model.ServiceSt
 func (s *Sender) labels(service string) []prompb.Label {
 	labels := []prompb.Label{
 		{Name: "__name__", Value: "systemd_service_state"},
-		{Name: "service", Value: service},
+		{Name: "name", Value: service},
 	}
 	for n, v := range s.cfg.Labels {
-		if n == "__name__" || n == "service" {
+		if n == "__name__" || n == "name" {
 			continue
 		}
 		labels = append(labels, prompb.Label{Name: n, Value: v})

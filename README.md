@@ -242,8 +242,8 @@ Each destination Prometheus must have the Remote Write receiver enabled:
 **The following metric is the historical service-availability metric delivered through Remote Write:**
 
 ```text
-systemd_service_state{service="cups.service",...} 0 <timestamp_ms>
-systemd_service_state{service="cups.service",...} 1 <timestamp_ms>
+systemd_service_state{name="cups.service",...} 0 <timestamp_ms>
+systemd_service_state{name="cups.service",...} 1 <timestamp_ms>
 ```
 
 Its semantics are:
@@ -253,7 +253,7 @@ Its semantics are:
 - transition samples use the **actual systemd transition timestamp**;
 - the timestamp is not replaced by the Remote Write request time;
 - every detected transition is delivered, including multiple transitions between Prometheus scrapes;
-- samples can contain arbitrary configured static labels in addition to `service`.
+- samples can contain arbitrary configured static labels in addition to `name`.
 
 The same `systemd_service_state` metric is also used for the current-state heartbeat. Heartbeat samples use the current exporter time and do not advance the transition checkpoint.
 
@@ -302,7 +302,7 @@ remote_write:
     role: scscf
 ```
 
-The `service` label and metric name are controlled by the exporter and cannot be overridden through this map.
+The `name` label and metric name are controlled by the exporter and cannot be overridden through this map. The unit identifier uses `name` rather than `service` so queries stay compatible with systemd_exporter.
 
 ### Current-state heartbeat
 
