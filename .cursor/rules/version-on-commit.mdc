@@ -1,0 +1,17 @@
+---
+description: Bump exporter version on every commit after asking
+alwaysApply: true
+---
+
+# Version on commit
+
+`internal/version/version.go` holds the release identifier logged at startup.
+
+When the user asks to create a git commit:
+
+1. Ask which version to set for this commit. Do not guess or auto-increment.
+2. After they answer, update `const Version` in `internal/version/version.go` to that value.
+3. Include the version file in the same commit.
+4. Do not commit if they have not given a version.
+
+This commit ships `0.9.0`. Later commits need a new version from the user.

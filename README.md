@@ -152,6 +152,8 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
+The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.0`, from `internal/version/version.go`.
+
 ## Configuration
 
 Example:

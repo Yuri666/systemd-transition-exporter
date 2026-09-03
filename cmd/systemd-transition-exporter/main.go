@@ -20,12 +20,14 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/recovery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
 	"github.com/Yuri666/systemd-transition-exporter/internal/systemd"
+	"github.com/Yuri666/systemd-transition-exporter/internal/version"
 	"github.com/Yuri666/systemd-transition-exporter/internal/wal"
 )
 
 func main() {
 	configPath := flag.String("config", "/etc/systemd-transition-exporter/config.yaml", "configuration file")
 	flag.Parse()
+	log.Printf("systemd-transition-exporter version %s", version.Version)
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal(err)
