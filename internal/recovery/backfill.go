@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	// SlotEndFraction keeps a millisecond fraction in the closing timestamp.
+	// SlotEndFraction keeps a millisecond fraction in the slot-edge timestamps.
 	// A sample landing on a whole second is rendered without a decimal part,
 	// and consumers that require fractional seconds skip it.
 	SlotEndFraction = 5 * time.Millisecond
@@ -31,10 +31,45 @@ func SlotStart(t time.Time, size time.Duration) time.Time {
 	return hour.Add(time.Duration(t.Minute()) * time.Minute / size * size)
 }
 
+// SlotOpeningTime is SlotEndFraction after the slot start: for a 15m grid it
+// is HH:00:00.005, HH:15:00.005, and so on.
+func SlotOpeningTime(slotStart time.Time) time.Time {
+	return slotStart.Add(SlotEndFraction)
+}
+
 // SlotClosingTime is one second before the end of the slot that begins at
 // slotStart, shifted by SlotEndFraction: for a 15m grid it is HH:14:59.005.
 func SlotClosingTime(slotStart time.Time, size time.Duration) time.Time {
 	return slotStart.Add(size - SlotEndLead)
+}
+
+// DueSlotOpening returns the opening timestamp of the slot containing now when
+// that instant has already been reached and the slot is still open. A zero
+// Time means the opener has not fallen due yet.
+func DueSlotOpening(now time.Time, size time.Duration) time.Time {
+	if size <= SlotEndLead {
+		return time.Time{}
+	}
+	start := SlotStart(now, size)
+	opening := SlotOpeningTime(start)
+	if !now.Before(opening) && now.Before(start.Add(size)) {
+		return opening
+	}
+	return time.Time{}
+}
+
+// NextSlotOpening is the next opening instant strictly after now, or the
+// current slot's opening when it is still in the future.
+func NextSlotOpening(now time.Time, size time.Duration) time.Time {
+	if size <= SlotEndLead {
+		return time.Time{}
+	}
+	start := SlotStart(now, size)
+	opening := SlotOpeningTime(start)
+	if now.Before(opening) {
+		return opening
+	}
+	return SlotOpeningTime(start.Add(size))
 }
 
 // DueSlotClosing returns the closing timestamp of the slot containing now when
@@ -90,8 +125,8 @@ func RecoveryWindow(ready time.Time, size time.Duration) (time.Time, time.Time, 
 // The state at the slot start is derived from the recovered transitions and
 // the currently observed state; see slotStartState. Nothing before the slot
 // start is ever generated: that interval is reported as uncovered instead.
-// The slot-closing sample is a live publication only; recovery does not
-// invent it.
+// The slot-edge samples (start+5ms and end−995ms) are a live publication
+// only; recovery does not invent them.
 func BuildStateFill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration, current map[string]model.AvailabilityState) ([]model.StateSample, error) {
 	if interval <= 0 || !end.After(start) {
 		return nil, nil

@@ -101,23 +101,29 @@ func (w *Worker) Run(ctx context.Context) {
 
 	batch, degradedSince := w.startup(ctx)
 	var pendingRecovery *RecoveryJob
-	var pendingClosings []time.Time
-	var nextClosing time.Time
-	var closingTimer *time.Timer
-	var closingC <-chan time.Time
+	var pendingSlotSamples []time.Time
+	var nextOpening, nextClosing time.Time
+	var slotTimer *time.Timer
+	var slotC <-chan time.Time
 	if w.cfg.RecoveryWindow > recovery.SlotEndLead {
 		now := time.Now()
-		if due := recovery.DueSlotClosing(now, w.cfg.RecoveryWindow); !due.IsZero() {
-			pendingClosings = append(pendingClosings, due)
+		size := w.cfg.RecoveryWindow
+		if due := recovery.DueSlotOpening(now, size); !due.IsZero() {
+			pendingSlotSamples = append(pendingSlotSamples, due)
 		}
-		nextClosing = recovery.NextSlotClosing(now, w.cfg.RecoveryWindow)
-		d := time.Until(nextClosing)
+		if due := recovery.DueSlotClosing(now, size); !due.IsZero() {
+			pendingSlotSamples = append(pendingSlotSamples, due)
+		}
+		nextOpening = recovery.NextSlotOpening(now, size)
+		nextClosing = recovery.NextSlotClosing(now, size)
+		nextDue := earlierTime(nextOpening, nextClosing)
+		d := time.Until(nextDue)
 		if d < 0 {
 			d = 0
 		}
-		closingTimer = time.NewTimer(d)
-		closingC = closingTimer.C
-		defer closingTimer.Stop()
+		slotTimer = time.NewTimer(d)
+		slotC = slotTimer.C
+		defer slotTimer.Stop()
 	}
 
 	markDegraded := func() {
@@ -220,50 +226,62 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 		sendCurrent(states)
 	}
-	sendClosing := func(at time.Time) bool {
+	sendSlotSample := func(at time.Time) bool {
 		if at.IsZero() || pendingRecovery != nil || len(w.queue) > 0 || !flush() {
 			return false
 		}
-		samples := slotClosingSamples(w.cfg.Services, w.cfg.CurrentState, at)
+		samples := slotStateSamples(w.cfg.Services, w.cfg.CurrentState, at)
 		if len(samples) == 0 {
 			return true
+		}
+		kind := "closing"
+		if recovery.SlotOpeningTime(recovery.SlotStart(at, w.cfg.RecoveryWindow)).Equal(at) {
+			kind = "opening"
 		}
 		if err := w.sender.SendRecoveredStates(ctx, samples); err != nil {
 			if ctx.Err() == nil {
 				markDegraded()
-				log.Printf("remote_write target=%s slot closing sample failed: %v", w.cfg.TargetID, err)
+				log.Printf("remote_write target=%s slot %s sample failed: %v", w.cfg.TargetID, kind, err)
 			}
 			return remote_write.IsPermanent(err)
 		}
-		log.Printf("remote_write target=%s slot closing sample at %s samples=%d", w.cfg.TargetID, at.Format(time.RFC3339Nano), len(samples))
+		log.Printf("remote_write target=%s slot %s sample at %s samples=%d", w.cfg.TargetID, kind, at.Format(time.RFC3339Nano), len(samples))
 		return true
 	}
-	tryClosings := func() {
-		for len(pendingClosings) > 0 {
-			if !sendClosing(pendingClosings[0]) {
+	trySlotSamples := func() {
+		for len(pendingSlotSamples) > 0 {
+			if !sendSlotSample(pendingSlotSamples[0]) {
 				return
 			}
-			pendingClosings = pendingClosings[1:]
+			pendingSlotSamples = pendingSlotSamples[1:]
 		}
 	}
-	enqueueClosing := func(at time.Time) {
+	enqueueSlotSample := func(at time.Time) {
 		if at.IsZero() {
 			return
 		}
-		if n := len(pendingClosings); n > 0 && pendingClosings[n-1].Equal(at) {
+		if n := len(pendingSlotSamples); n > 0 && pendingSlotSamples[n-1].Equal(at) {
 			return
 		}
-		pendingClosings = append(pendingClosings, at)
-		if len(pendingClosings) > 2 {
-			pendingClosings = pendingClosings[len(pendingClosings)-2:]
+		pendingSlotSamples = append(pendingSlotSamples, at)
+		if len(pendingSlotSamples) > 4 {
+			pendingSlotSamples = pendingSlotSamples[len(pendingSlotSamples)-4:]
 		}
+	}
+	advancePast := func(fired time.Time) {
+		size := w.cfg.RecoveryWindow
+		if fired.Equal(nextOpening) {
+			nextOpening = recovery.SlotOpeningTime(recovery.SlotStart(nextOpening, size).Add(size))
+			return
+		}
+		nextClosing = recovery.SlotClosingTime(recovery.SlotStart(nextClosing, size).Add(size), size)
 	}
 
 	for {
 		if pendingRecovery != nil && sendRecovery(pendingRecovery) {
 			pendingRecovery = nil
 		}
-		tryClosings()
+		trySlotSamples()
 		select {
 		case cmd := <-w.queue:
 			switch {
@@ -286,21 +304,24 @@ func (w *Worker) Run(ctx context.Context) {
 			flush()
 		case <-stateTicker.C:
 			heartbeat()
-		case <-closingC:
-			enqueueClosing(nextClosing)
+		case <-slotC:
+			fired := earlierTime(nextOpening, nextClosing)
+			enqueueSlotSample(fired)
+			advancePast(fired)
 			now := time.Now()
 			for {
-				nextClosing = recovery.SlotClosingTime(recovery.SlotStart(nextClosing, w.cfg.RecoveryWindow).Add(w.cfg.RecoveryWindow), w.cfg.RecoveryWindow)
-				if now.Before(nextClosing) {
+				n := earlierTime(nextOpening, nextClosing)
+				if now.Before(n) {
+					d := time.Until(n)
+					if d < 0 {
+						d = 0
+					}
+					slotTimer.Reset(d)
 					break
 				}
-				enqueueClosing(nextClosing)
+				enqueueSlotSample(n)
+				advancePast(n)
 			}
-			d := time.Until(nextClosing)
-			if d < 0 {
-				d = 0
-			}
-			closingTimer.Reset(d)
 		case <-ctx.Done():
 			flush()
 			return
@@ -344,7 +365,7 @@ func (w *Worker) startup(ctx context.Context) ([]model.Event, time.Time) {
 	return nil, degradedSince
 }
 
-func slotClosingSamples(services []string, current func(string) (model.ServiceState, bool), at time.Time) []model.StateSample {
+func slotStateSamples(services []string, current func(string) (model.ServiceState, bool), at time.Time) []model.StateSample {
 	if current == nil || at.IsZero() {
 		return nil
 	}
@@ -358,4 +379,14 @@ func slotClosingSamples(services []string, current func(string) (model.ServiceSt
 		out = append(out, model.StateSample{Service: service, State: state.Availability, TimestampUnixMS: ts})
 	}
 	return out
+}
+
+func earlierTime(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() || a.Before(b) {
+		return a
+	}
+	return b
 }

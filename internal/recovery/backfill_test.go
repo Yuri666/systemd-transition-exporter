@@ -96,6 +96,44 @@ func TestStateFillKeepsExactTransitionTimestamps(t *testing.T) {
 	}
 }
 
+func TestSlotOpeningTimeIsFractionAfterSlotStart(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	got := SlotOpeningTime(start)
+	want := time.Date(2026, 9, 4, 15, 0, 0, int(5*time.Millisecond), loc)
+	if !got.Equal(want) {
+		t.Fatalf("SlotOpeningTime = %s, want %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+func TestDueSlotOpeningOnlyInsideOpenSlotAfterFraction(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	opening := SlotOpeningTime(start)
+	if due := DueSlotOpening(start, 15*time.Minute); !due.IsZero() {
+		t.Fatalf("opening is not due on the slot boundary, got %s", due)
+	}
+	if due := DueSlotOpening(opening, 15*time.Minute); !due.Equal(opening) {
+		t.Fatalf("opening is due at the fraction instant, got %s", due)
+	}
+	if due := DueSlotOpening(start.Add(15*time.Minute), 15*time.Minute); !due.IsZero() {
+		t.Fatalf("next slot must not report the previous opening, got %s", due)
+	}
+}
+
+func TestNextSlotOpeningSkipsAnInstantThatHasPassed(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	opening := SlotOpeningTime(start)
+	if got := NextSlotOpening(start, 15*time.Minute); !got.Equal(opening) {
+		t.Fatalf("next opening = %s, want current %s", got, opening)
+	}
+	next := SlotOpeningTime(start.Add(15 * time.Minute))
+	if got := NextSlotOpening(opening, 15*time.Minute); !got.Equal(next) {
+		t.Fatalf("next opening after due instant = %s, want %s", got, next)
+	}
+}
+
 func TestSlotClosingTimeIsLeadBeforeSlotEnd(t *testing.T) {
 	loc := time.FixedZone("TEST", 3*60*60)
 	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
@@ -143,10 +181,11 @@ func TestStateFillDoesNotPublishSlotClosingSample(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildStateFill: %v", err)
 	}
+	opening := SlotOpeningTime(start).UnixMilli()
 	closing := SlotClosingTime(start, 15*time.Minute).UnixMilli()
 	for _, sample := range samples {
-		if sample.TimestampUnixMS == closing {
-			t.Fatal("recovery fill must not invent the live slot-closing sample")
+		if sample.TimestampUnixMS == opening || sample.TimestampUnixMS == closing {
+			t.Fatal("recovery fill must not invent the live slot-edge samples")
 		}
 	}
 }

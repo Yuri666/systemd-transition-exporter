@@ -47,9 +47,9 @@ remote_write:
   # Only the current local-time slot is recovered. For example, if the
   # exporter becomes ready at 15:14, the slot 15:00..15:14 is read from the
   # journal and refilled, while earlier closed slots are left untouched.
-  # One second before each slot boundary (plus 5ms, so the timestamp keeps a
-  # millisecond fraction) the current state is published in normal operation.
-  # Recovery fill does not add this sample.
+  # At each slot edge the current state is published in normal operation:
+  # start+5ms and end-995ms, so timestamps keep a millisecond fraction.
+  # Recovery fill does not add these samples.
   recovery_window: 15m
 
   # Arbitrary constant labels added to every remote_write time series.
