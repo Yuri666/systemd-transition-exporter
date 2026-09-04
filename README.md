@@ -152,7 +152,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.2`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.3`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -322,11 +322,12 @@ A heartbeat:
 
 Slot-end samples are separate from the heartbeat. `recovery_window` defines
 the local-time grid (for example 15m → `HH:00`, `HH:15`, …). In normal
-operation, exactly one second before each boundary the exporter publishes the
-current state with that timestamp (`HH:14:59.000` for a 15m grid). The whole
-second is deliberate: the sample carries no sub-second fraction, so consumers
-reading fixed-precision timestamps still match it. Recovery fill does not
-synthesize this point: it only replays ticks and recovered transitions.
+operation, one second before each boundary the exporter publishes the current
+state with that timestamp, shifted by 5 milliseconds: `HH:14:59.005` for a 15m
+grid. The fraction is deliberate — a sample landing on a whole second is
+rendered without a decimal part, and consumers that require fractional seconds
+skip it. Recovery fill does not synthesize this point: it only replays ticks
+and recovered transitions.
 
 This prevents a long-running service time series from disappearing because no new sample was received for an extended period.
 
@@ -574,7 +575,7 @@ Each recovered slot therefore contains:
 The live slot-closing sample (one second before the `recovery_window`
 boundary) is published only in normal operation, not as part of recovery
 fill. It carries the then-current state and the intended timestamp
-(`slot end − 1s`), so a range query covering `[HH:MM, HH:MM+window)` still
+(`slot end − 995ms`), so a range query covering `[HH:MM, HH:MM+window)` still
 sees a point inside the slot. A heartbeat on `state_interval` continues
 independently and keeps the series from going stale between slot boundaries.
 

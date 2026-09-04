@@ -100,7 +100,7 @@ func TestSlotClosingTimeIsLeadBeforeSlotEnd(t *testing.T) {
 	loc := time.FixedZone("TEST", 3*60*60)
 	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
 	got := SlotClosingTime(start, 15*time.Minute)
-	want := time.Date(2026, 9, 4, 15, 14, 59, 0, loc)
+	want := time.Date(2026, 9, 4, 15, 14, 59, int(5*time.Millisecond), loc)
 	if !got.Equal(want) {
 		t.Fatalf("SlotClosingTime = %s, want %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
 	}
