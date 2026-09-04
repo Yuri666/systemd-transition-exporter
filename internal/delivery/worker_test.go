@@ -124,3 +124,22 @@ func TestBothTargetsReceiveSameTransition(t *testing.T) {
 		t.Fatalf("requests: first=%d second=%d", firstRequests.Load(), secondRequests.Load())
 	}
 }
+
+func TestSlotClosingSamplesUseExplicitTimestamp(t *testing.T) {
+	at := time.Date(2026, 9, 4, 15, 14, 58, 600000000, time.Local)
+	samples := slotClosingSamples([]string{"cups.service", "missing.service"}, func(service string) (model.ServiceState, bool) {
+		if service != "cups.service" {
+			return model.ServiceState{}, false
+		}
+		return model.ServiceState{Service: service, Availability: model.StateUp}, true
+	}, at)
+	if len(samples) != 1 {
+		t.Fatalf("samples = %d, want 1", len(samples))
+	}
+	if samples[0].TimestampUnixMS != at.UnixMilli() {
+		t.Fatalf("timestamp = %d, want %d", samples[0].TimestampUnixMS, at.UnixMilli())
+	}
+	if samples[0].State != model.StateUp || samples[0].Service != "cups.service" {
+		t.Fatalf("sample = %+v", samples[0])
+	}
+}

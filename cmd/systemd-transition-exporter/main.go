@@ -233,15 +233,16 @@ func main() {
 			log.Fatalf("remote_write target=%s: %v", target.ID, err)
 		}
 		worker := delivery.New(delivery.Config{
-			TargetID:      target.ID,
-			BatchSize:     cfg.RemoteWrite.BatchSize,
-			FlushInterval: cfg.RemoteWrite.FlushInterval,
-			StateInterval: cfg.RemoteWrite.StateInterval,
-			Services:      cfg.Services,
-			StartupEvents: deliveryStartupEvents,
-			StartupFill:   startupFill,
-			StartupSlot:   startupSlotStart,
-			CurrentState:  eng.State,
+			TargetID:       target.ID,
+			BatchSize:      cfg.RemoteWrite.BatchSize,
+			FlushInterval:  cfg.RemoteWrite.FlushInterval,
+			StateInterval:  cfg.RemoteWrite.StateInterval,
+			RecoveryWindow: cfg.RemoteWrite.RecoveryWindow,
+			Services:       cfg.Services,
+			StartupEvents:  deliveryStartupEvents,
+			StartupFill:    startupFill,
+			StartupSlot:    startupSlotStart,
+			CurrentState:   eng.State,
 			BuildSlotFill: func(ctx context.Context) ([]model.StateSample, error) {
 				windowStart, windowEnd, ok := recovery.RecoveryWindow(time.Now(), cfg.RemoteWrite.RecoveryWindow)
 				if !ok {

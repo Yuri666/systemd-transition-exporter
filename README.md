@@ -152,7 +152,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.0`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.1`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -319,6 +319,12 @@ A heartbeat:
 - does not receive a transition sequence number;
 - does not change the transition WAL/checkpoint;
 - uses the current timestamp when sent.
+
+Slot-end samples are separate from the heartbeat. `recovery_window` defines
+the local-time grid (for example 15m → `HH:00`, `HH:15`, …). In normal
+operation, 1.4 seconds before each boundary the exporter publishes the
+current state with that historical timestamp. Recovery fill does not
+synthesize this point: it only replays ticks and recovered transitions.
 
 This prevents a long-running service time series from disappearing because no new sample was received for an extended period.
 
@@ -562,6 +568,13 @@ Each recovered slot therefore contains:
 
 - one sample per `recovery_fill_interval` tick carrying the effective state;
 - one sample at the exact timestamp of every recovered transition.
+
+The live slot-closing sample (1.4 seconds before the `recovery_window`
+boundary) is published only in normal operation, not as part of recovery
+fill. It carries the then-current state and the intended timestamp
+(`slot end − 1.4s`), so a range query covering `[HH:MM, HH:MM+window)` still
+sees a point inside the slot. A heartbeat on `state_interval` continues
+independently and keeps the series from going stale between slot boundaries.
 
 Samples inside the slot may be older than data Prometheus already holds, for
 example when only the last minutes of the slot were missing. Prometheus rejects

@@ -96,6 +96,61 @@ func TestStateFillKeepsExactTransitionTimestamps(t *testing.T) {
 	}
 }
 
+func TestSlotClosingTimeIsLeadBeforeSlotEnd(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	got := SlotClosingTime(start, 15*time.Minute)
+	want := time.Date(2026, 9, 4, 15, 14, 58, 600000000, loc)
+	if !got.Equal(want) {
+		t.Fatalf("SlotClosingTime = %s, want %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+func TestDueSlotClosingOnlyInsideOpenSlotAfterLead(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	closing := SlotClosingTime(start, 15*time.Minute)
+	if due := DueSlotClosing(closing.Add(-time.Millisecond), 15*time.Minute); !due.IsZero() {
+		t.Fatalf("closing is not due before the lead instant, got %s", due)
+	}
+	if due := DueSlotClosing(closing, 15*time.Minute); !due.Equal(closing) {
+		t.Fatalf("closing is due at the lead instant, got %s", due)
+	}
+	if due := DueSlotClosing(start.Add(15*time.Minute), 15*time.Minute); !due.IsZero() {
+		t.Fatalf("next slot must not report the previous closing, got %s", due)
+	}
+}
+
+func TestNextSlotClosingSkipsAnInstantThatHasPassed(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	closing := SlotClosingTime(start, 15*time.Minute)
+	if got := NextSlotClosing(closing.Add(-time.Second), 15*time.Minute); !got.Equal(closing) {
+		t.Fatalf("next closing = %s, want current %s", got, closing)
+	}
+	next := SlotClosingTime(start.Add(15*time.Minute), 15*time.Minute)
+	if got := NextSlotClosing(closing, 15*time.Minute); !got.Equal(next) {
+		t.Fatalf("next closing after due instant = %s, want %s", got, next)
+	}
+}
+
+func TestStateFillDoesNotPublishSlotClosingSample(t *testing.T) {
+	loc := time.FixedZone("TEST", 3*60*60)
+	start := time.Date(2026, 9, 4, 15, 0, 0, 0, loc)
+	end := start.Add(15 * time.Minute)
+	current := map[string]model.AvailabilityState{"cups.service": model.StateUp}
+	samples, err := BuildStateFill(context.Background(), []string{"cups.service"}, start, end, nil, time.Minute, current)
+	if err != nil {
+		t.Fatalf("BuildStateFill: %v", err)
+	}
+	closing := SlotClosingTime(start, 15*time.Minute).UnixMilli()
+	for _, sample := range samples {
+		if sample.TimestampUnixMS == closing {
+			t.Fatal("recovery fill must not invent the live slot-closing sample")
+		}
+	}
+}
+
 func TestSlotStartStateUsesCurrentStateWhenSlotHasNoTransition(t *testing.T) {
 	start := time.Date(2026, 8, 27, 14, 30, 0, 0, time.Local)
 	current := map[string]model.AvailabilityState{"cups.service": model.StateUp}

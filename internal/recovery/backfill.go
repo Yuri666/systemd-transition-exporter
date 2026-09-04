@@ -12,11 +12,50 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
 
+// SlotEndLead is how long before the slot boundary the current state is
+// published so a range query aligned to the slot still sees a sample inside
+// [start, end) rather than on the next slot's start.
+const SlotEndLead = 1400 * time.Millisecond
+
 // SlotStart returns the beginning of the local-time slot containing t. The grid
 // is anchored at each hour, so a 15m window yields HH:00, HH:15, HH:30, HH:45.
 func SlotStart(t time.Time, size time.Duration) time.Time {
 	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
 	return hour.Add(time.Duration(t.Minute()) * time.Minute / size * size)
+}
+
+// SlotClosingTime is 1.4s before the end of the slot that begins at slotStart.
+func SlotClosingTime(slotStart time.Time, size time.Duration) time.Time {
+	return slotStart.Add(size - SlotEndLead)
+}
+
+// DueSlotClosing returns the closing timestamp of the slot containing now when
+// that instant has already been reached and the slot is still open. A zero
+// Time means the closer has not fallen due yet.
+func DueSlotClosing(now time.Time, size time.Duration) time.Time {
+	if size <= SlotEndLead {
+		return time.Time{}
+	}
+	start := SlotStart(now, size)
+	closing := SlotClosingTime(start, size)
+	if !now.Before(closing) && now.Before(start.Add(size)) {
+		return closing
+	}
+	return time.Time{}
+}
+
+// NextSlotClosing is the next closing instant strictly after now, or the
+// current slot's closing when it is still in the future.
+func NextSlotClosing(now time.Time, size time.Duration) time.Time {
+	if size <= SlotEndLead {
+		return time.Time{}
+	}
+	start := SlotStart(now, size)
+	closing := SlotClosingTime(start, size)
+	if now.Before(closing) {
+		return closing
+	}
+	return SlotClosingTime(start.Add(size), size)
 }
 
 // RecoveryWindow returns only the current local-time slot [slot start, ready).
@@ -43,6 +82,8 @@ func RecoveryWindow(ready time.Time, size time.Duration) (time.Time, time.Time, 
 // The state at the slot start is derived from the recovered transitions and
 // the currently observed state; see slotStartState. Nothing before the slot
 // start is ever generated: that interval is reported as uncovered instead.
+// The 1.4s-before-boundary sample is a live publication only; recovery does
+// not invent it.
 func BuildStateFill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration, current map[string]model.AvailabilityState) ([]model.StateSample, error) {
 	if interval <= 0 || !end.After(start) {
 		return nil, nil

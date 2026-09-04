@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
+	"github.com/Yuri666/systemd-transition-exporter/internal/recovery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
 )
 
@@ -22,17 +23,18 @@ type RecoveryJob struct {
 }
 
 type Config struct {
-	TargetID      string
-	BatchSize     int
-	FlushInterval time.Duration
-	StateInterval time.Duration
-	Services      []string
-	StartupEvents []model.Event
-	StartupFill   []model.StateSample
-	StartupSlot   time.Time
-	CurrentState  func(string) (model.ServiceState, bool)
-	BuildSlotFill func(context.Context) ([]model.StateSample, error)
-	OnDropped     func(string, int)
+	TargetID       string
+	BatchSize      int
+	FlushInterval  time.Duration
+	StateInterval  time.Duration
+	RecoveryWindow time.Duration
+	Services       []string
+	StartupEvents  []model.Event
+	StartupFill    []model.StateSample
+	StartupSlot    time.Time
+	CurrentState   func(string) (model.ServiceState, bool)
+	BuildSlotFill  func(context.Context) ([]model.StateSample, error)
+	OnDropped      func(string, int)
 }
 
 type command struct {
@@ -99,6 +101,24 @@ func (w *Worker) Run(ctx context.Context) {
 
 	batch, degradedSince := w.startup(ctx)
 	var pendingRecovery *RecoveryJob
+	var pendingClosings []time.Time
+	var nextClosing time.Time
+	var closingTimer *time.Timer
+	var closingC <-chan time.Time
+	if w.cfg.RecoveryWindow > recovery.SlotEndLead {
+		now := time.Now()
+		if due := recovery.DueSlotClosing(now, w.cfg.RecoveryWindow); !due.IsZero() {
+			pendingClosings = append(pendingClosings, due)
+		}
+		nextClosing = recovery.NextSlotClosing(now, w.cfg.RecoveryWindow)
+		d := time.Until(nextClosing)
+		if d < 0 {
+			d = 0
+		}
+		closingTimer = time.NewTimer(d)
+		closingC = closingTimer.C
+		defer closingTimer.Stop()
+	}
 
 	markDegraded := func() {
 		if degradedSince.IsZero() {
@@ -200,11 +220,50 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 		sendCurrent(states)
 	}
+	sendClosing := func(at time.Time) bool {
+		if at.IsZero() || pendingRecovery != nil || len(w.queue) > 0 || !flush() {
+			return false
+		}
+		samples := slotClosingSamples(w.cfg.Services, w.cfg.CurrentState, at)
+		if len(samples) == 0 {
+			return true
+		}
+		if err := w.sender.SendRecoveredStates(ctx, samples); err != nil {
+			if ctx.Err() == nil {
+				markDegraded()
+				log.Printf("remote_write target=%s slot closing sample failed: %v", w.cfg.TargetID, err)
+			}
+			return remote_write.IsPermanent(err)
+		}
+		log.Printf("remote_write target=%s slot closing sample at %s samples=%d", w.cfg.TargetID, at.Format(time.RFC3339Nano), len(samples))
+		return true
+	}
+	tryClosings := func() {
+		for len(pendingClosings) > 0 {
+			if !sendClosing(pendingClosings[0]) {
+				return
+			}
+			pendingClosings = pendingClosings[1:]
+		}
+	}
+	enqueueClosing := func(at time.Time) {
+		if at.IsZero() {
+			return
+		}
+		if n := len(pendingClosings); n > 0 && pendingClosings[n-1].Equal(at) {
+			return
+		}
+		pendingClosings = append(pendingClosings, at)
+		if len(pendingClosings) > 2 {
+			pendingClosings = pendingClosings[len(pendingClosings)-2:]
+		}
+	}
 
 	for {
 		if pendingRecovery != nil && sendRecovery(pendingRecovery) {
 			pendingRecovery = nil
 		}
+		tryClosings()
 		select {
 		case cmd := <-w.queue:
 			switch {
@@ -227,6 +286,21 @@ func (w *Worker) Run(ctx context.Context) {
 			flush()
 		case <-stateTicker.C:
 			heartbeat()
+		case <-closingC:
+			enqueueClosing(nextClosing)
+			now := time.Now()
+			for {
+				nextClosing = recovery.SlotClosingTime(recovery.SlotStart(nextClosing, w.cfg.RecoveryWindow).Add(w.cfg.RecoveryWindow), w.cfg.RecoveryWindow)
+				if now.Before(nextClosing) {
+					break
+				}
+				enqueueClosing(nextClosing)
+			}
+			d := time.Until(nextClosing)
+			if d < 0 {
+				d = 0
+			}
+			closingTimer.Reset(d)
 		case <-ctx.Done():
 			flush()
 			return
@@ -268,4 +342,20 @@ func (w *Worker) startup(ctx context.Context) ([]model.Event, time.Time) {
 		return pending[split:], time.Now()
 	}
 	return nil, degradedSince
+}
+
+func slotClosingSamples(services []string, current func(string) (model.ServiceState, bool), at time.Time) []model.StateSample {
+	if current == nil || at.IsZero() {
+		return nil
+	}
+	ts := at.UnixMilli()
+	out := make([]model.StateSample, 0, len(services))
+	for _, service := range services {
+		state, ok := current(service)
+		if !ok {
+			continue
+		}
+		out = append(out, model.StateSample{Service: service, State: state.Availability, TimestampUnixMS: ts})
+	}
+	return out
 }
