@@ -14,8 +14,10 @@ import (
 
 // SlotEndLead is how long before the slot boundary the current state is
 // published so a range query aligned to the slot still sees a sample inside
-// [start, end) rather than on the next slot's start.
-const SlotEndLead = 1400 * time.Millisecond
+// [start, end) rather than on the next slot's start. It is a whole second, so
+// the sample timestamp carries no sub-second fraction and consumers that
+// expect fixed-precision timestamps still match it.
+const SlotEndLead = time.Second
 
 // SlotStart returns the beginning of the local-time slot containing t. The grid
 // is anchored at each hour, so a 15m window yields HH:00, HH:15, HH:30, HH:45.
@@ -24,7 +26,8 @@ func SlotStart(t time.Time, size time.Duration) time.Time {
 	return hour.Add(time.Duration(t.Minute()) * time.Minute / size * size)
 }
 
-// SlotClosingTime is 1.4s before the end of the slot that begins at slotStart.
+// SlotClosingTime is one second before the end of the slot that begins at
+// slotStart.
 func SlotClosingTime(slotStart time.Time, size time.Duration) time.Time {
 	return slotStart.Add(size - SlotEndLead)
 }
@@ -82,8 +85,8 @@ func RecoveryWindow(ready time.Time, size time.Duration) (time.Time, time.Time, 
 // The state at the slot start is derived from the recovered transitions and
 // the currently observed state; see slotStartState. Nothing before the slot
 // start is ever generated: that interval is reported as uncovered instead.
-// The 1.4s-before-boundary sample is a live publication only; recovery does
-// not invent it.
+// The one-second-before-boundary sample is a live publication only; recovery
+// does not invent it.
 func BuildStateFill(ctx context.Context, services []string, start, end time.Time, events []model.Event, interval time.Duration, current map[string]model.AvailabilityState) ([]model.StateSample, error) {
 	if interval <= 0 || !end.After(start) {
 		return nil, nil

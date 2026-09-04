@@ -126,7 +126,7 @@ func TestBothTargetsReceiveSameTransition(t *testing.T) {
 }
 
 func TestSlotClosingSamplesUseExplicitTimestamp(t *testing.T) {
-	at := time.Date(2026, 9, 4, 15, 14, 58, 600000000, time.Local)
+	at := time.Date(2026, 9, 4, 15, 14, 59, 0, time.Local)
 	samples := slotClosingSamples([]string{"cups.service", "missing.service"}, func(service string) (model.ServiceState, bool) {
 		if service != "cups.service" {
 			return model.ServiceState{}, false

@@ -14,4 +14,4 @@ When the user asks to create a git commit:
 3. Include the version file in the same commit.
 4. Do not commit if they have not given a version.
 
-This commit ships `0.9.1`. Later commits need a new version from the user.
+This commit ships `0.9.2`. Later commits need a new version from the user.
