@@ -211,8 +211,8 @@ func TestCurrentStateDoesNotAdvanceTransitionCheckpoint(t *testing.T) {
 	}))
 	defer server.Close()
 	s := testSender(t, server.URL, filepath.Join(t.TempDir(), "checkpoint.json"))
-	if err := s.SendCurrentStates(context.Background(), []model.ServiceState{{Service: "cups.service", Availability: model.StateUp}}); err != nil {
-		t.Fatalf("SendCurrentStates: %v", err)
+	if err := s.SendRecoveredStates(context.Background(), []model.StateSample{{Service: "cups.service", State: model.StateUp, TimestampUnixMS: 1000}}); err != nil {
+		t.Fatalf("SendRecoveredStates: %v", err)
 	}
 	if !gotState {
 		t.Fatal("current state metric was not sent")

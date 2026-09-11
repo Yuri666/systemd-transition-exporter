@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +13,40 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
 )
+
+type recordingSender struct {
+	mu      sync.Mutex
+	events  []model.Event
+	samples []model.StateSample
+}
+
+func (s *recordingSender) Send(_ context.Context, events []model.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, events...)
+	return nil
+}
+
+func (s *recordingSender) SendRecoveredStates(_ context.Context, samples []model.StateSample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.samples = append(s.samples, samples...)
+	return nil
+}
+
+func (s *recordingSender) LastSent() uint64 { return 0 }
+
+func (s *recordingSender) sentEvents() []model.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.Event(nil), s.events...)
+}
+
+func (s *recordingSender) sentSamples() []model.StateSample {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.StateSample(nil), s.samples...)
+}
 
 func newTestWorker(t *testing.T, ctx context.Context, id, url string) (*Worker, *remote_write.Sender) {
 	t.Helper()
@@ -122,6 +157,37 @@ func TestBothTargetsReceiveSameTransition(t *testing.T) {
 	waitFor(t, func() bool { return firstSender.LastSent() == 7 && secondSender.LastSent() == 7 })
 	if firstRequests.Load() == 0 || secondRequests.Load() == 0 {
 		t.Fatalf("requests: first=%d second=%d", firstRequests.Load(), secondRequests.Load())
+	}
+}
+
+func TestStateSampleUsesObservationTimeAndSkipsStaleValue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &recordingSender{}
+	worker := New(Config{
+		TargetID:      "observed",
+		BatchSize:     1,
+		FlushInterval: 10 * time.Millisecond,
+		StateInterval: time.Hour,
+	}, sender)
+	go worker.Run(ctx)
+
+	up := time.Now()
+	if !worker.EnqueueEvent(model.Event{Sequence: 1, Service: "cups.service", State: model.StateUp, EventTimeUnixMS: up.UnixMilli()}) {
+		t.Fatal("failed to enqueue transition")
+	}
+	waitFor(t, func() bool { return len(sender.sentEvents()) == 1 })
+
+	// Observed before the transition but delivered after it: publishing this
+	// value would put a down sample after the up transition.
+	worker.EnqueueState(model.ServiceState{Service: "cups.service", Availability: model.StateDown}, up.Add(-500*time.Millisecond))
+	observed := up.Add(500 * time.Millisecond)
+	worker.EnqueueState(model.ServiceState{Service: "cups.service", Availability: model.StateUp}, observed)
+
+	waitFor(t, func() bool { return len(sender.sentSamples()) == 1 })
+	samples := sender.sentSamples()
+	if samples[0].State != model.StateUp || samples[0].TimestampUnixMS != observed.UnixMilli() {
+		t.Fatalf("published sample = %+v, want up at %d", samples[0], observed.UnixMilli())
 	}
 }
 

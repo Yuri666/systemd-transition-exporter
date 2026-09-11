@@ -317,8 +317,12 @@ func main() {
 			}
 		}
 		reg.SetState(s.Service, state.Availability)
+		observedAt := s.ObservedAt
+		if observedAt.IsZero() {
+			observedAt = time.Now()
+		}
 		for _, target := range targets {
-			if !target.worker.EnqueueState(state) {
+			if !target.worker.EnqueueState(state, observedAt) {
 				log.Printf("remote_write target=%s state queue full; state for %s will be sent at next state_interval", target.worker.TargetID(), s.Service)
 			}
 		}

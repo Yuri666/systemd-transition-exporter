@@ -102,8 +102,8 @@ The collector does not use an application-level `Peer.Ping` timeout as the trans
               internal/remote_write
                  /           \
                 /             \
-       transition samples   state heartbeat
-       event timestamp      current timestamp
+       transition samples   state samples
+       event timestamp      observation timestamp
                 \             /
                  \           /
                   v         v
@@ -257,7 +257,7 @@ Its semantics are:
 - every detected transition is delivered, including multiple transitions between Prometheus scrapes;
 - samples can contain arbitrary configured static labels in addition to `name`.
 
-The same `systemd_service_state` metric is also used for the current-state heartbeat. Heartbeat samples use the current exporter time and do not advance the transition checkpoint.
+The same `systemd_service_state` metric is also used for the current-state heartbeat. Heartbeat samples are stamped with the time the state was observed and do not advance the transition checkpoint.
 
 Each sender retries failed delivery and maintains its own durable checkpoint of
 the last successfully delivered transition sequence. A successful HTTP `2xx`
@@ -318,7 +318,17 @@ A heartbeat:
 - does not increment transition counters;
 - does not receive a transition sequence number;
 - does not change the transition WAL/checkpoint;
-- uses the current timestamp when sent.
+- is stamped with the moment the availability was observed, not the moment it
+  was delivered.
+
+The last point matters because transitions are stamped with systemd's own
+`ActiveEnterTimestamp`/`ActiveExitTimestamp`, which lie in the past by the time
+the request reaches the receiver. A state sample carrying the delivery time
+would land after such a transition while describing an earlier moment, and a
+restart would appear in the series as several extra flips within one second.
+For the same reason a state sample that is not newer than the last sample
+already published for its series is skipped: it can only repeat what a
+transition has already recorded.
 
 Slot-edge samples are separate from the heartbeat. `recovery_window` defines
 the local-time grid (for example 15m → `HH:00`, `HH:15`, …). In normal

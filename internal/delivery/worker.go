@@ -13,7 +13,6 @@ import (
 type Sender interface {
 	Send(context.Context, []model.Event) error
 	SendRecoveredStates(context.Context, []model.StateSample) error
-	SendCurrentStates(context.Context, []model.ServiceState) error
 	LastSent() uint64
 }
 
@@ -39,14 +38,27 @@ type Config struct {
 
 type command struct {
 	event    *model.Event
-	state    *model.ServiceState
+	state    *stateUpdate
 	recovery *RecoveryJob
+}
+
+// stateUpdate carries the availability together with the moment it was
+// observed. The observation time becomes the sample timestamp: stamping the
+// delivery time instead would place a value from the queue after a transition
+// that systemd timestamped in the past, which shows up as a spurious flip.
+type stateUpdate struct {
+	state      model.ServiceState
+	observedAt time.Time
 }
 
 type Worker struct {
 	cfg    Config
 	sender Sender
 	queue  chan command
+
+	// published is the latest sample timestamp accepted per service. Only the
+	// Run goroutine touches it.
+	published map[string]int64
 }
 
 func New(cfg Config, sender Sender) *Worker {
@@ -54,9 +66,10 @@ func New(cfg Config, sender Sender) *Worker {
 		cfg.BatchSize = 100
 	}
 	return &Worker{
-		cfg:    cfg,
-		sender: sender,
-		queue:  make(chan command, 100000),
+		cfg:       cfg,
+		sender:    sender,
+		queue:     make(chan command, 100000),
+		published: make(map[string]int64),
 	}
 }
 
@@ -71,9 +84,9 @@ func (w *Worker) EnqueueEvent(event model.Event) bool {
 	}
 }
 
-func (w *Worker) EnqueueState(state model.ServiceState) bool {
+func (w *Worker) EnqueueState(state model.ServiceState, observedAt time.Time) bool {
 	select {
-	case w.queue <- command{state: &state}:
+	case w.queue <- command{state: &stateUpdate{state: state, observedAt: observedAt}}:
 		return true
 	default:
 		return false
@@ -143,6 +156,7 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 		err := w.sender.Send(ctx, batch)
 		if err == nil {
+			w.noteEvents(batch)
 			batch = batch[:0]
 			return true
 		}
@@ -182,16 +196,29 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			return false
 		}
+		w.noteEvents(job.Events)
 		return true
 	}
-	sendCurrent := func(states []model.ServiceState) {
-		if len(states) == 0 || pendingRecovery != nil || !flush() {
+	// sendCurrent publishes availability samples stamped with the time the
+	// availability was observed. Samples that are not newer than what the
+	// series already holds are dropped: such a sample carries stale
+	// information about a moment a transition has already described.
+	sendCurrent := func(samples []model.StateSample) {
+		if len(samples) == 0 || pendingRecovery != nil || !flush() {
 			return
 		}
-		if err := w.sender.SendCurrentStates(ctx, states); err != nil && ctx.Err() == nil {
-			markDegraded()
-			log.Printf("remote_write target=%s current state failed: %v", w.cfg.TargetID, err)
+		samples = w.dropStale(samples)
+		if len(samples) == 0 {
+			return
 		}
+		if err := w.sender.SendRecoveredStates(ctx, samples); err != nil {
+			if ctx.Err() == nil {
+				markDegraded()
+				log.Printf("remote_write target=%s current state failed: %v", w.cfg.TargetID, err)
+			}
+			return
+		}
+		w.noteSamples(samples)
 	}
 	heartbeat := func() {
 		// Commands are produced in observation order. Do not let an internal
@@ -218,13 +245,7 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			degradedSince = time.Time{}
 		}
-		states := make([]model.ServiceState, 0, len(w.cfg.Services))
-		for _, service := range w.cfg.Services {
-			if state, ok := w.cfg.CurrentState(service); ok {
-				states = append(states, state)
-			}
-		}
-		sendCurrent(states)
+		sendCurrent(slotStateSamples(w.cfg.Services, w.cfg.CurrentState, time.Now()))
 	}
 	sendSlotSample := func(at time.Time) bool {
 		if at.IsZero() || pendingRecovery != nil || len(w.queue) > 0 || !flush() {
@@ -245,6 +266,7 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			return remote_write.IsPermanent(err)
 		}
+		w.noteSamples(samples)
 		log.Printf("remote_write target=%s slot %s sample at %s samples=%d", w.cfg.TargetID, kind, at.Format(time.RFC3339Nano), len(samples))
 		return true
 	}
@@ -298,7 +320,7 @@ func (w *Worker) Run(ctx context.Context) {
 					pendingRecovery.Events = append(pendingRecovery.Events, cmd.recovery.Events...)
 				}
 			case cmd.state != nil:
-				sendCurrent([]model.ServiceState{*cmd.state})
+				sendCurrent(stateSamples(*cmd.state))
 			}
 		case <-flushTicker.C:
 			flush()
@@ -350,6 +372,7 @@ func (w *Worker) startup(ctx context.Context) ([]model.Event, time.Time) {
 		}
 		return pending, time.Now()
 	}
+	w.noteEvents(pending[:split])
 	if err := w.sender.SendRecoveredStates(ctx, w.cfg.StartupFill); err != nil {
 		if ctx.Err() == nil {
 			log.Printf("remote_write target=%s startup fill stopped: %v", w.cfg.TargetID, err)
@@ -362,7 +385,52 @@ func (w *Worker) startup(ctx context.Context) ([]model.Event, time.Time) {
 		}
 		return pending[split:], time.Now()
 	}
+	w.noteEvents(pending[split:])
 	return nil, degradedSince
+}
+
+// dropStale removes samples that are not newer than the last sample published
+// for the same series. Delivery lag lets a queued availability value reach the
+// receiver after a transition whose timestamp comes from systemd and therefore
+// lies in the past; keeping such a sample would contradict that transition.
+func (w *Worker) dropStale(samples []model.StateSample) []model.StateSample {
+	out := make([]model.StateSample, 0, len(samples))
+	for _, sample := range samples {
+		if last, ok := w.published[sample.Service]; ok && sample.TimestampUnixMS <= last {
+			continue
+		}
+		out = append(out, sample)
+	}
+	return out
+}
+
+func (w *Worker) noteSamples(samples []model.StateSample) {
+	for _, sample := range samples {
+		w.notePublished(sample.Service, sample.TimestampUnixMS)
+	}
+}
+
+func (w *Worker) noteEvents(events []model.Event) {
+	for _, event := range events {
+		w.notePublished(event.Service, event.EventTimeUnixMS)
+	}
+}
+
+func (w *Worker) notePublished(service string, timestampUnixMS int64) {
+	if last, ok := w.published[service]; !ok || timestampUnixMS > last {
+		w.published[service] = timestampUnixMS
+	}
+}
+
+func stateSamples(update stateUpdate) []model.StateSample {
+	if update.state.Service == "" || update.observedAt.IsZero() {
+		return nil
+	}
+	return []model.StateSample{{
+		Service:         update.state.Service,
+		State:           update.state.Availability,
+		TimestampUnixMS: update.observedAt.UnixMilli(),
+	}}
 }
 
 func slotStateSamples(services []string, current func(string) (model.ServiceState, bool), at time.Time) []model.StateSample {

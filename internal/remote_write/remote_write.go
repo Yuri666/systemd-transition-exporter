@@ -233,11 +233,12 @@ func (s *Sender) sendEventsLocked(ctx context.Context, events []model.Event) err
 	return nil
 }
 
-// SendRecoveredStates sends historical state samples generated for a recovered
-// interval. These samples deliberately do not advance the transition
-// checkpoint because they are synthetic continuity samples rather than
-// observed transitions. The caller serializes this call with transition
-// delivery so samples for a series remain timestamp ordered.
+// SendRecoveredStates sends state samples with caller supplied timestamps:
+// recovery fill, slot edges and the availability observed for a unit. These
+// samples deliberately do not advance the transition checkpoint because they
+// are continuity samples rather than observed transitions. The caller
+// serializes this call with transition delivery so samples for a series remain
+// timestamp ordered.
 func (s *Sender) SendRecoveredStates(ctx context.Context, samples []model.StateSample) error {
 	if s == nil || len(samples) == 0 {
 		return nil
@@ -257,30 +258,6 @@ func (s *Sender) SendRecoveredStates(ctx context.Context, samples []model.StateS
 			value = 1
 		}
 		ts.Samples = append(ts.Samples, prompb.Sample{Value: value, Timestamp: sample.TimestampUnixMS})
-	}
-	return s.sendSeries(ctx, series)
-}
-
-// SendCurrentStates writes heartbeat samples using the current timestamp. It
-// never advances the transition checkpoint: a heartbeat is not a transition.
-func (s *Sender) SendCurrentStates(ctx context.Context, states []model.ServiceState) error {
-	if s == nil || len(states) == 0 {
-		return nil
-	}
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-
-	now := time.Now().UnixMilli()
-	series := make(map[string]*prompb.TimeSeries)
-	for _, st := range states {
-		v := float64(0)
-		if st.Availability == model.StateUp {
-			v = 1
-		}
-		series[st.Service] = &prompb.TimeSeries{
-			Labels:  s.labels(st.Service),
-			Samples: []prompb.Sample{{Value: v, Timestamp: now}},
-		}
 	}
 	return s.sendSeries(ctx, series)
 }
