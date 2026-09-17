@@ -38,17 +38,7 @@ type Config struct {
 
 type command struct {
 	event    *model.Event
-	state    *stateUpdate
 	recovery *RecoveryJob
-}
-
-// stateUpdate carries the availability together with the moment it was
-// observed. The observation time becomes the sample timestamp: stamping the
-// delivery time instead would place a value from the queue after a transition
-// that systemd timestamped in the past, which shows up as a spurious flip.
-type stateUpdate struct {
-	state      model.ServiceState
-	observedAt time.Time
 }
 
 type Worker struct {
@@ -78,15 +68,6 @@ func (w *Worker) TargetID() string { return w.cfg.TargetID }
 func (w *Worker) EnqueueEvent(event model.Event) bool {
 	select {
 	case w.queue <- command{event: &event}:
-		return true
-	default:
-		return false
-	}
-}
-
-func (w *Worker) EnqueueState(state model.ServiceState, observedAt time.Time) bool {
-	select {
-	case w.queue <- command{state: &stateUpdate{state: state, observedAt: observedAt}}:
 		return true
 	default:
 		return false
@@ -319,8 +300,6 @@ func (w *Worker) Run(ctx context.Context) {
 					pendingRecovery.Fill = append(pendingRecovery.Fill, cmd.recovery.Fill...)
 					pendingRecovery.Events = append(pendingRecovery.Events, cmd.recovery.Events...)
 				}
-			case cmd.state != nil:
-				sendCurrent(stateSamples(*cmd.state))
 			}
 		case <-flushTicker.C:
 			flush()
@@ -420,17 +399,6 @@ func (w *Worker) notePublished(service string, timestampUnixMS int64) {
 	if last, ok := w.published[service]; !ok || timestampUnixMS > last {
 		w.published[service] = timestampUnixMS
 	}
-}
-
-func stateSamples(update stateUpdate) []model.StateSample {
-	if update.state.Service == "" || update.observedAt.IsZero() {
-		return nil
-	}
-	return []model.StateSample{{
-		Service:         update.state.Service,
-		State:           update.state.Availability,
-		TimestampUnixMS: update.observedAt.UnixMilli(),
-	}}
 }
 
 func slotStateSamples(services []string, current func(string) (model.ServiceState, bool), at time.Time) []model.StateSample {

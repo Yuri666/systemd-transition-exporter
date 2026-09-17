@@ -160,34 +160,23 @@ func TestBothTargetsReceiveSameTransition(t *testing.T) {
 	}
 }
 
-func TestStateSampleUsesObservationTimeAndSkipsStaleValue(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sender := &recordingSender{}
-	worker := New(Config{
-		TargetID:      "observed",
-		BatchSize:     1,
-		FlushInterval: 10 * time.Millisecond,
-		StateInterval: time.Hour,
-	}, sender)
-	go worker.Run(ctx)
-
-	up := time.Now()
-	if !worker.EnqueueEvent(model.Event{Sequence: 1, Service: "cups.service", State: model.StateUp, EventTimeUnixMS: up.UnixMilli()}) {
-		t.Fatal("failed to enqueue transition")
+func TestDropStaleSkipsSamplesNotNewerThanPublished(t *testing.T) {
+	worker := New(Config{TargetID: "stale"}, &recordingSender{})
+	worker.noteEvents([]model.Event{{Service: "cups.service", EventTimeUnixMS: 2000}})
+	got := worker.dropStale([]model.StateSample{
+		{Service: "cups.service", State: model.StateDown, TimestampUnixMS: 1500},
+		{Service: "cups.service", State: model.StateUp, TimestampUnixMS: 2000},
+		{Service: "cups.service", State: model.StateUp, TimestampUnixMS: 2500},
+		{Service: "other.service", State: model.StateUp, TimestampUnixMS: 1000},
+	})
+	if len(got) != 2 {
+		t.Fatalf("samples = %d, want 2", len(got))
 	}
-	waitFor(t, func() bool { return len(sender.sentEvents()) == 1 })
-
-	// Observed before the transition but delivered after it: publishing this
-	// value would put a down sample after the up transition.
-	worker.EnqueueState(model.ServiceState{Service: "cups.service", Availability: model.StateDown}, up.Add(-500*time.Millisecond))
-	observed := up.Add(500 * time.Millisecond)
-	worker.EnqueueState(model.ServiceState{Service: "cups.service", Availability: model.StateUp}, observed)
-
-	waitFor(t, func() bool { return len(sender.sentSamples()) == 1 })
-	samples := sender.sentSamples()
-	if samples[0].State != model.StateUp || samples[0].TimestampUnixMS != observed.UnixMilli() {
-		t.Fatalf("published sample = %+v, want up at %d", samples[0], observed.UnixMilli())
+	if got[0].TimestampUnixMS != 2500 || got[0].Service != "cups.service" {
+		t.Fatalf("first kept = %+v, want cups.service at 2500", got[0])
+	}
+	if got[1].Service != "other.service" || got[1].TimestampUnixMS != 1000 {
+		t.Fatalf("second kept = %+v, want other.service at 1000", got[1])
 	}
 }
 

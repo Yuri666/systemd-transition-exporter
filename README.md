@@ -19,7 +19,7 @@ For example, if a service changes state twice between two Prometheus scrapes:
 
 the exporter sends two Remote Write samples with timestamps `19:15:26` and `19:15:36`, rather than reporting only the state observed at the next scrape.
 
-The exporter also periodically sends the current state so that a continuously-running service remains present in the Prometheus time series. The current state is sent immediately after the initial systemd snapshot and after reconnect, then periodically according to `remote_write.state_interval`.
+The exporter also periodically sends the current state so that a continuously-running service remains present in the Prometheus time series. Availability samples are published on `remote_write.state_interval` and at the edges of each recovery slot. A systemd snapshot does not emit a Remote Write sample of its own: only detected transitions, the heartbeat and the slot edges do.
 
 ## Availability state mapping
 
@@ -53,7 +53,7 @@ Implemented:
 - Remote Write checkpointing and retry after temporary destination failures.
 - Configurable arbitrary static labels added to Remote Write series.
 - Periodic current-state Remote Write heartbeat.
-- Immediate current-state Remote Write after startup snapshot and D-Bus reconnect.
+- Slot-edge current-state Remote Write samples.
 - Crash/restart tests for WAL and Remote Write checkpoint handling.
 - systemd deployment unit.
 
@@ -312,23 +312,21 @@ The `name` label and metric name are controlled by the exporter and cannot be ov
 
 A heartbeat:
 
-- is sent immediately after the initial systemd snapshot;
-- is sent immediately after a successful D-Bus reconnect/snapshot;
-- is then sent periodically according to `state_interval`;
+- is sent periodically according to `state_interval`;
+- is not sent on every systemd snapshot: snapshots only update the engine,
+  WAL and `/metrics`, and emit a Remote Write sample when they produce a
+  transition;
 - does not increment transition counters;
 - does not receive a transition sequence number;
 - does not change the transition WAL/checkpoint;
-- is stamped with the moment the availability was observed, not the moment it
-  was delivered.
+- is stamped with the moment the availability is read for the heartbeat, not
+  the moment the HTTP request is delivered.
 
-The last point matters because transitions are stamped with systemd's own
+A heartbeat or slot-edge sample that is not newer than the last sample already
+published for its series is skipped: it can only repeat what a transition has
+already recorded. Transitions are stamped with systemd's own
 `ActiveEnterTimestamp`/`ActiveExitTimestamp`, which lie in the past by the time
-the request reaches the receiver. A state sample carrying the delivery time
-would land after such a transition while describing an earlier moment, and a
-restart would appear in the series as several extra flips within one second.
-For the same reason a state sample that is not newer than the last sample
-already published for its series is skipped: it can only repeat what a
-transition has already recorded.
+the request reaches the receiver.
 
 Slot-edge samples are separate from the heartbeat. `recovery_window` defines
 the local-time grid (for example 15m → `HH:00`, `HH:15`, …). In normal
@@ -548,6 +546,15 @@ The exporter uses:
 
 Wall-clock transition timestamps are stored in microseconds internally and exported in milliseconds for Remote Write samples and seconds where Prometheus metric names require seconds.
 
+All four timestamps, `ActiveState` and `SubState` are read with a single
+`org.freedesktop.DBus.Properties.GetAll` call, so they describe one moment.
+Property-by-property reads spread the answer over six round trips, and systemd
+was free to activate the unit in between: the snapshot then combined an
+`ActiveState` from before the activation with an `ActiveEnterTimestamp` from
+after it, reporting a running unit as down while emitting its start
+transition. The observation time is taken before the call, so it is never
+later than the state it describes.
+
 ## Multiple transitions between observations
 
 The engine compares previous and current systemd enter/exit timestamps and emits newly observed transitions in timestamp order, allowing multiple transitions to be detected between observations.
@@ -754,7 +761,7 @@ make check
 - durable Remote Write checkpoints;
 - Remote Write retries;
 - recovery after collector crash;
-- current-state heartbeat and startup/reconnect state publication.
+- current-state heartbeat and slot-edge state publication.
 
 ### Production hardening
 

@@ -112,52 +112,74 @@ func (d *DBus) LoadUnit(service string) (*Unit, error) {
 	return &Unit{conn: d.conn, path: p, service: service}, nil
 }
 
+// Snapshot reads the unit properties in a single D-Bus call. Reading them one
+// at a time spread the answer over six round trips, and systemd was free to
+// activate the unit in between: the result then mixed an ActiveState from
+// before the activation with an ActiveEnterTimestamp from after it, so the
+// snapshot reported a unit as down while already carrying the timestamp of its
+// start. The observation time is taken before the call, so it can never be
+// later than the state it describes.
 func (u *Unit) Snapshot(bootID string) (model.UnitSnapshot, error) {
-	obj := u.Object()
-	get := func(n string) (interface{}, error) {
-		v, e := obj.GetProperty(unitIface + "." + n)
-		if e != nil {
-			return nil, fmt.Errorf("get %s: %w", n, e)
+	observedAt := time.Now()
+	call := u.Object().Call(propertiesIF+".GetAll", 0, unitIface)
+	if call.Err != nil {
+		return model.UnitSnapshot{}, fmt.Errorf("GetAll(%s): %w", u.service, call.Err)
+	}
+	var props map[string]dbus.Variant
+	if err := call.Store(&props); err != nil {
+		return model.UnitSnapshot{}, fmt.Errorf("decode properties of %s: %w", u.service, err)
+	}
+	return snapshotFromProperties(u.service, bootID, observedAt, props)
+}
+
+func snapshotFromProperties(service, bootID string, observedAt time.Time, props map[string]dbus.Variant) (model.UnitSnapshot, error) {
+	text := func(name string) (string, error) {
+		v, ok := props[name]
+		if !ok {
+			return "", fmt.Errorf("property %s of %s is missing", name, service)
 		}
-		return v.Value(), nil
+		s, ok := v.Value().(string)
+		if !ok {
+			return "", fmt.Errorf("%s has type %T", name, v.Value())
+		}
+		return s, nil
 	}
-	a, e := get("ActiveState")
-	if e != nil {
-		return model.UnitSnapshot{}, e
+	timestamp := func(name string) (uint64, error) {
+		v, ok := props[name]
+		if !ok {
+			return 0, fmt.Errorf("property %s of %s is missing", name, service)
+		}
+		return asUint64(v.Value()), nil
 	}
-	s, e := get("SubState")
-	if e != nil {
-		return model.UnitSnapshot{}, e
+	activeState, err := text("ActiveState")
+	if err != nil {
+		return model.UnitSnapshot{}, err
 	}
-	en, e := get("ActiveEnterTimestamp")
-	if e != nil {
-		return model.UnitSnapshot{}, e
+	subState, err := text("SubState")
+	if err != nil {
+		return model.UnitSnapshot{}, err
 	}
-	ex, e := get("ActiveExitTimestamp")
-	if e != nil {
-		return model.UnitSnapshot{}, e
+	enter, err := timestamp("ActiveEnterTimestamp")
+	if err != nil {
+		return model.UnitSnapshot{}, err
 	}
-	enm, e := get("ActiveEnterTimestampMonotonic")
-	if e != nil {
-		return model.UnitSnapshot{}, e
+	exit, err := timestamp("ActiveExitTimestamp")
+	if err != nil {
+		return model.UnitSnapshot{}, err
 	}
-	exm, e := get("ActiveExitTimestampMonotonic")
-	if e != nil {
-		return model.UnitSnapshot{}, e
+	enterMono, err := timestamp("ActiveEnterTimestampMonotonic")
+	if err != nil {
+		return model.UnitSnapshot{}, err
 	}
-	as, ok := a.(string)
-	if !ok {
-		return model.UnitSnapshot{}, fmt.Errorf("ActiveState has type %T", a)
-	}
-	ss, ok := s.(string)
-	if !ok {
-		return model.UnitSnapshot{}, fmt.Errorf("SubState has type %T", s)
+	exitMono, err := timestamp("ActiveExitTimestampMonotonic")
+	if err != nil {
+		return model.UnitSnapshot{}, err
 	}
 	return model.UnitSnapshot{
-		Service: u.service, ActiveState: as, SubState: ss,
-		ActiveEnterTimestampUS: asUint64(en), ActiveExitTimestampUS: asUint64(ex),
-		ActiveEnterTimestampMonotonicUS: asUint64(enm), ActiveExitTimestampMonotonicUS: asUint64(exm),
-		BootID: bootID, ObservedAt: time.Now(),
+		Service: service, ActiveState: activeState, SubState: subState,
+		ActiveEnterTimestampUS: enter, ActiveExitTimestampUS: exit,
+		ActiveEnterTimestampMonotonicUS: enterMono, ActiveExitTimestampMonotonicUS: exitMono,
+		BootID: bootID, ObservedAt: observedAt,
 	}, nil
 }
 
