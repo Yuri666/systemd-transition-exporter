@@ -61,6 +61,9 @@ func main() {
 			log.Fatal(err)
 		}
 		defer eventLog.Close()
+		if report := eventLog.Repaired(); !report.Empty() {
+			log.Printf("WAL repaired at startup: skipped_records=%d truncated_bytes=%d state_reset=%t", report.SkippedRecords, report.TruncatedBytes, report.StateReset)
+		}
 		for _, state := range eventLog.States() {
 			eng.RestoreState(state)
 			reg.SetState(state.Service, state.Availability)
@@ -79,18 +82,23 @@ func main() {
 	walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
 	var durableEvents []model.Event
 	if cfg.WAL.Enabled {
-		if events, e := wal.ReadAll(walPath); e == nil {
-			durableEvents = events
-			for _, event := range events {
-				eng.Replay(event)
-				reg.Event(event)
-			}
-			if len(events) > 0 {
-				log.Printf("replayed %d durable transition events from WAL", len(events))
-			}
-		} else if !os.IsNotExist(e) {
-			_ = httpListener.Close()
-			log.Fatalf("replay WAL: %v", e)
+		// History is useful but not required to monitor the running services,
+		// so an unreadable log is logged and left behind instead of stopping
+		// the process, which systemd would restart into the same failure.
+		events, report, e := wal.ReadAll(walPath)
+		if e != nil && !os.IsNotExist(e) {
+			log.Printf("replay WAL: %v", e)
+		}
+		if !report.Empty() {
+			log.Printf("replay WAL: skipped_records=%d truncated_bytes=%d", report.SkippedRecords, report.TruncatedBytes)
+		}
+		durableEvents = events
+		for _, event := range events {
+			eng.Replay(event)
+			reg.Event(event)
+		}
+		if len(events) > 0 {
+			log.Printf("replayed %d durable transition events from WAL", len(events))
 		}
 	}
 
@@ -201,10 +209,9 @@ func main() {
 
 	deliveryStartupEvents := startupRecovered
 	if cfg.WAL.Enabled {
-		events, err := wal.ReadAll(walPath)
+		events, _, err := wal.ReadAll(walPath)
 		if err != nil && !os.IsNotExist(err) {
-			_ = httpListener.Close()
-			log.Fatalf("remote_write WAL scan: %v", err)
+			log.Printf("remote_write WAL scan: %v", err)
 		}
 		deliveryStartupEvents = events
 	}

@@ -675,6 +675,28 @@ checkpoint named from the configured checkpoint base plus its stable target ID,
 for example `remote_write.checkpoint.8bf3a21c54d0`. Heartbeat samples do not
 advance transition checkpoints.
 
+### Damaged records
+
+A crash or a full disk can interrupt an append between the record and its
+newline, and an unclean shutdown can leave a zero-filled tail. Such damage
+never prevents startup: history is useful, but the running services can be
+monitored without it, and a fatal replay would only make systemd restart the
+exporter into the same failure.
+
+- An interrupted trailing record is truncated when the WAL is opened, so the
+  next append starts at a record boundary instead of merging into the partial
+  line.
+- A record that cannot be decoded is skipped, and replay continues with the
+  remaining ones.
+- A damaged `state.json` is discarded; the last observed state is re-read from
+  systemd on the first snapshot.
+
+Anything discarded is reported at startup, for example:
+
+```text
+WAL repaired at startup: skipped_records=0 truncated_bytes=37 state_reset=false
+```
+
 Remote Write is deliberately **at-least-once per target**. A target checkpoint
 advances only after that receiver returns `2xx` and the checkpoint file has
 been durably persisted. A crash in the narrow interval after receiver
