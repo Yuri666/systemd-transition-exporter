@@ -306,6 +306,16 @@ remote_write:
 
 The `name` label and metric name are controlled by the exporter and cannot be overridden through this map. The unit identifier uses `name` rather than `service` so queries stay compatible with systemd_exporter.
 
+Prometheus identifies a time series only by its label set. Two exporters that
+share `name` and every configured label write into the same series, even when
+they run on different hosts. Set `instance` to this host's hostname or FQDN so
+each copy owns its own series. At startup the exporter logs the local hostname
+and the configured labels; if `instance` is missing or does not match this
+host, it logs a warning and continues. The same identity is exposed as
+`systemd_transition_exporter_identity_info` on `/metrics`. An HTTP 400 from the
+receiver also mentions this collision, because overlapping writers look like
+out-of-order samples.
+
 ### Current-state heartbeat
 
 `remote_write.state_interval` controls how often the exporter sends the current state of every monitored service. The default is one minute.
@@ -363,7 +373,9 @@ receiver, because it missed both transitions and heartbeats:
   and would block every later transition. The events remain in the WAL and
   `systemd_transition_exporter_remote_write_dropped_events_total` is increased.
   A growing counter almost always means the receiver accepts no out-of-order
-  samples, or accepts a window smaller than one recovery slot.
+  samples, or accepts a window smaller than one recovery slot. HTTP 400 can
+  also mean a second exporter is writing `systemd_service_state` with the same
+  labels; the rejection log line says so.
 
 Other configured receivers continue receiving transitions and heartbeats
 during the outage. Recovery, ordering and checkpoint advancement are maintained
@@ -372,6 +384,16 @@ separately for each target.
 ## Prometheus metrics (`/metrics`)
 
 The `/metrics` endpoint intentionally exposes **exporter/transport diagnostics only**. Service state, transition counters and transition timestamps are not exposed through `/metrics`; they are delivered through Remote Write to avoid creating duplicate Prometheus series from scrape and Remote Write.
+
+### Identity
+
+```text
+# HELP systemd_transition_exporter_identity_info Host identity used to detect two exporters writing the same Remote Write series.
+# TYPE systemd_transition_exporter_identity_info gauge
+systemd_transition_exporter_identity_info{hostname="cscf01",instance="cscf01.es.tz.vimpelcom.ru",listen="0.0.0.0:9877"} 1
+```
+
+**`systemd_transition_exporter_identity_info`** — hostname, configured `instance` label and listen address of this process. Compare `hostname` and `instance` when two hosts appear to write one series.
 
 ### D-Bus metrics
 
@@ -464,6 +486,7 @@ The complete metric set is therefore:
 | `systemd_service_state` | **No** | **Yes** | Service availability and historical transitions |
 | `systemd_service_transitions_total` | **No** | No | Internal transition counter used by the exporter implementation/history |
 | `systemd_service_last_transition_timestamp_seconds` | **No** | No | Internal last-transition timestamp |
+| `systemd_transition_exporter_identity_info` | **Yes** | No | Hostname, configured instance and listen address |
 | `systemd_transition_exporter_dbus_connected` | **Yes** | No | D-Bus connectivity |
 | `systemd_transition_exporter_dbus_disconnects_total` | **Yes** | No | D-Bus disconnect counter |
 | `systemd_transition_exporter_dbus_last_change_timestamp_seconds` | **Yes** | No | Last D-Bus state-change timestamp |

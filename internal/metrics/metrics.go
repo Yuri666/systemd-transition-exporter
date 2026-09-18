@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,10 @@ type Registry struct {
 	dbusLastChangeMS   int64
 	dbusDisconnectedAt time.Time
 
+	identityHostname string
+	identityInstance string
+	identityListen   string
+
 	remoteWrite        map[string]remote_write.Stats
 	remoteWriteDropped map[string]uint64
 
@@ -40,6 +45,14 @@ func New() *Registry {
 		remoteWrite:        make(map[string]remote_write.Stats),
 		remoteWriteDropped: make(map[string]uint64),
 	}
+}
+
+func (r *Registry) SetIdentity(hostname, instance, listen string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.identityHostname = hostname
+	r.identityInstance = instance
+	r.identityListen = listen
 }
 
 func (r *Registry) SetState(service string, state model.AvailabilityState) {
@@ -141,6 +154,10 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	defer r.mu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_identity_info Host identity used to detect two exporters writing the same Remote Write series.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_identity_info gauge")
+	fmt.Fprintf(w, "systemd_transition_exporter_identity_info{hostname=%s,instance=%s,listen=%s} 1\n", promLabel(r.identityHostname), promLabel(r.identityInstance), promLabel(r.identityListen))
+
 	// Service state, transition counters and transition timestamps are
 	// delivered exclusively through Remote Write. They are intentionally not
 	// exposed here because scraping the same series would create duplicate
@@ -220,4 +237,11 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_recovery_uncovered_seconds Portion of the last requested observation gap before the current recovery slot that was intentionally not recovered.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_recovery_uncovered_seconds gauge")
 	fmt.Fprintf(w, "systemd_transition_exporter_recovery_uncovered_seconds %g\n", r.uncoveredSeconds)
+}
+
+func promLabel(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	v = strings.ReplaceAll(v, "\n", `\n`)
+	return `"` + v + `"`
 }

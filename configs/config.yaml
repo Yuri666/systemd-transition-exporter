@@ -53,8 +53,11 @@ remote_write:
   recovery_window: 15m
 
   # Arbitrary constant labels added to every remote_write time series.
-  # 'service' and '__name__' are reserved and must not be configured here.
+  # 'name' and '__name__' are reserved and must not be configured here.
+  # 'instance' must be this host's hostname or FQDN: two exporters with
+  # identical labels write the same Prometheus series.
   labels:
+    instance: cscf01.es.tz.vimpelcom.ru
     environment: production
     site: test
     role: ims

@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/config"
 	"github.com/Yuri666/systemd-transition-exporter/internal/delivery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/engine"
+	"github.com/Yuri666/systemd-transition-exporter/internal/identity"
 	"github.com/Yuri666/systemd-transition-exporter/internal/metrics"
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 	"github.com/Yuri666/systemd-transition-exporter/internal/recovery"
@@ -32,6 +34,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	hostnames := identity.LocalHostnames()
+	log.Printf("remote_write identity host=%s listen=%s labels=%s", strings.Join(hostnames, ","), cfg.Server.Listen, identity.FormatLabels(cfg.RemoteWrite.Labels))
+	if cfg.RemoteWrite.Enabled {
+		for _, warning := range identity.Warnings(cfg.RemoteWrite.Labels, hostnames) {
+			log.Print(warning)
+		}
+	}
 
 	httpListener, err := net.Listen("tcp", cfg.Server.Listen)
 	if err != nil {
@@ -43,6 +52,7 @@ func main() {
 
 	eng := engine.New()
 	reg := metrics.New()
+	reg.SetIdentity(identity.PrimaryHostname(hostnames), cfg.RemoteWrite.Labels["instance"], cfg.Server.Listen)
 	var eventLog *wal.WAL
 	if cfg.WAL.Enabled {
 		eventLog, err = wal.Open(cfg.WAL.Directory, cfg.WAL.Fsync)

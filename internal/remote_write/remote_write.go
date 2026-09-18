@@ -53,7 +53,11 @@ type PermanentError struct {
 }
 
 func (e *PermanentError) Error() string {
-	return fmt.Sprintf("remote_write rejected request: HTTP %d", e.StatusCode)
+	msg := fmt.Sprintf("remote_write rejected request: HTTP %d", e.StatusCode)
+	if e.StatusCode == http.StatusBadRequest {
+		msg += "; if another exporter writes systemd_service_state with the same labels, samples collide and the receiver rejects them as out of order"
+	}
+	return msg
 }
 
 func IsPermanent(err error) bool {

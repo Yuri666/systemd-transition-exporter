@@ -38,6 +38,19 @@ func TestHandlerDoesNotExposeRemoteWriteServiceSeries(t *testing.T) {
 	}
 }
 
+func TestHandlerExposesIdentityInfo(t *testing.T) {
+	r := New()
+	r.SetIdentity("vm-lab-cscf-1", "cscf01.es.tz.vimpelcom.ru", "0.0.0.0:9877")
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.Handler(w, req)
+	want := `systemd_transition_exporter_identity_info{hostname="vm-lab-cscf-1",instance="cscf01.es.tz.vimpelcom.ru",listen="0.0.0.0:9877"} 1`
+	if !strings.Contains(w.Body.String(), want) {
+		t.Fatalf("/metrics does not contain identity info:\n%s", w.Body.String())
+	}
+}
+
 func TestHandlerGroupsHelpAndTypeByMetricFamily(t *testing.T) {
 	r := New()
 	r.SetDBusConnected(true, time.UnixMilli(1000))
