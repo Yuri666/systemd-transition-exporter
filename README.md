@@ -197,7 +197,11 @@ remote_write:
     role: ims
 ```
 
-`server.listen` is the HTTP listen address. `server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
+`server.listen` is the HTTP listen address for `/metrics`, `/health` and `/ready`.
+The TCP port is set from the command line with `--web.listen-port`; that flag
+replaces the port in `server.listen` and leaves the host unchanged. Without the
+flag the address from the file is used, defaulting to `127.0.0.1:9877`.
+`server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
 
 `wal.enabled`, `wal.directory` and `wal.fsync` control the durable collector event log. The WAL file is `<wal.directory>/events.jsonl`.
 
@@ -507,7 +511,7 @@ The complete metric set is therefore:
 
 ```bash
 go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
-./bin/systemd-transition-exporter --config ./configs/config.yaml
+./bin/systemd-transition-exporter --config ./configs/config.yaml --web.listen-port 9877
 ```
 
 Metrics endpoint:

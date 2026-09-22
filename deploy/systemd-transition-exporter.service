@@ -5,7 +5,7 @@ Requires=dbus.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/systemd-transition-exporter --config /etc/systemd-transition-exporter/config.yaml
+ExecStart=/usr/local/bin/systemd-transition-exporter --config /etc/systemd-transition-exporter/config.yaml --web.listen-port 9877
 Restart=always
 RestartSec=2s
 

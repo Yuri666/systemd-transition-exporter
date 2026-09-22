@@ -3,7 +3,9 @@ package config
 import (
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -164,6 +166,23 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+// WithListenPort replaces the TCP port in a host:port listen address. The host
+// is taken from listen; an empty listen binds all addresses on the new port.
+func WithListenPort(listen string, port int) (string, error) {
+	if port < 1 || port > 65535 {
+		return "", fmt.Errorf("web.listen-port must be between 1 and 65535")
+	}
+	host := ""
+	if strings.TrimSpace(listen) != "" {
+		var err error
+		host, _, err = net.SplitHostPort(listen)
+		if err != nil {
+			return "", fmt.Errorf("server.listen %q: %w", listen, err)
+		}
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 func validLabelName(s string) bool {

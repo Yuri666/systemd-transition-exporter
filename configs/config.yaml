@@ -1,4 +1,6 @@
 server:
+  # Host for /metrics, /health and /ready. Override the TCP port from the
+  # command line: --web.listen-port 9877
   listen: "0.0.0.0:9877"
   # Enables the destructive POST /debug/dbus/disconnect test endpoint.
   debug: false

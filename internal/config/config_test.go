@@ -87,3 +87,29 @@ func TestRemoteWriteRejectsMixedURLForms(t *testing.T) {
 		t.Fatal("url and urls unexpectedly accepted together")
 	}
 }
+
+func TestWithListenPortKeepsHost(t *testing.T) {
+	got, err := WithListenPort("0.0.0.0:9877", 9910)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "0.0.0.0:9910" {
+		t.Fatalf("listen = %q, want 0.0.0.0:9910", got)
+	}
+	got, err = WithListenPort("[::1]:9877", 9100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "[::1]:9100" {
+		t.Fatalf("listen = %q, want [::1]:9100", got)
+	}
+}
+
+func TestWithListenPortRejectsOutOfRange(t *testing.T) {
+	if _, err := WithListenPort("127.0.0.1:9877", 0); err == nil {
+		t.Fatal("port 0 unexpectedly accepted")
+	}
+	if _, err := WithListenPort("127.0.0.1:9877", 65536); err == nil {
+		t.Fatal("port 65536 unexpectedly accepted")
+	}
+}

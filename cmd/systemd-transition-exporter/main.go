@@ -28,11 +28,18 @@ import (
 
 func main() {
 	configPath := flag.String("config", "/etc/systemd-transition-exporter/config.yaml", "configuration file")
+	listenPort := flag.Int("web.listen-port", 0, "TCP port for /metrics, /health and /ready; overrides the port in server.listen")
 	flag.Parse()
 	log.Printf("systemd-transition-exporter version %s", version.Version)
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *listenPort != 0 {
+		cfg.Server.Listen, err = config.WithListenPort(cfg.Server.Listen, *listenPort)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	hostnames := identity.LocalHostnames()
 	log.Printf("remote_write identity host=%s listen=%s labels=%s", strings.Join(hostnames, ","), cfg.Server.Listen, identity.FormatLabels(cfg.RemoteWrite.Labels))
