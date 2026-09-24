@@ -267,18 +267,7 @@ func main() {
 			StartupFill:    startupFill,
 			StartupSlot:    startupSlotStart,
 			CurrentState:   eng.State,
-			BuildSlotFill: func(ctx context.Context) ([]model.StateSample, error) {
-				windowStart, windowEnd, ok := recovery.RecoveryWindow(time.Now(), cfg.RemoteWrite.RecoveryWindow)
-				if !ok {
-					return nil, nil
-				}
-				events, err := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd)
-				if err != nil {
-					return nil, err
-				}
-				return recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, engineStates())
-			},
-			OnDropped: reg.AddDroppedEvents,
+			OnDropped:      reg.AddDroppedEvents,
 		}, sender)
 		targets = append(targets, targetRuntime{sender: sender, worker: worker})
 		reg.SetRemoteWriteStats(target.ID, sender.Stats())

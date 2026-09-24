@@ -21,6 +21,11 @@ type RecoveryJob struct {
 	Events []model.Event
 }
 
+// maxPendingStates bounds the availability backlog kept while a receiver is
+// unreachable. One slot of heartbeat ticks for a realistic unit list stays far
+// below it; the cap only matters for an outage much longer than a slot.
+const maxPendingStates = 10000
+
 type Config struct {
 	TargetID       string
 	BatchSize      int
@@ -32,7 +37,6 @@ type Config struct {
 	StartupFill    []model.StateSample
 	StartupSlot    time.Time
 	CurrentState   func(string) (model.ServiceState, bool)
-	BuildSlotFill  func(context.Context) ([]model.StateSample, error)
 	OnDropped      func(string, int)
 }
 
@@ -46,9 +50,11 @@ type Worker struct {
 	sender Sender
 	queue  chan command
 
-	// published is the latest sample timestamp accepted per service. Only the
-	// Run goroutine touches it.
-	published map[string]int64
+	// published is the latest sample timestamp accepted per service, and
+	// pendingStates holds the availability samples the receiver has not
+	// accepted yet. Only the Run goroutine touches them.
+	published     map[string]int64
+	pendingStates []model.StateSample
 }
 
 func New(cfg Config, sender Sender) *Worker {
@@ -137,7 +143,6 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 		err := w.sender.Send(ctx, batch)
 		if err == nil {
-			w.noteEvents(batch)
 			batch = batch[:0]
 			return true
 		}
@@ -177,78 +182,81 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			return false
 		}
-		w.noteEvents(job.Events)
 		return true
 	}
-	// sendCurrent publishes availability samples stamped with the time the
-	// availability was observed. Samples that are not newer than what the
-	// series already holds are dropped: such a sample carries stale
-	// information about a moment a transition has already described.
-	sendCurrent := func(samples []model.StateSample) {
-		if len(samples) == 0 || pendingRecovery != nil || !flush() {
-			return
+	// deliverStates sends the availability backlog. Transitions go first: they
+	// are older by definition, so a receiver sees the history that explains a
+	// state before the state itself. While the send fails the samples stay
+	// buffered, which is what turns a receiver outage into a gap the exporter
+	// can still fill once the receiver answers again.
+	deliverStates := func() bool {
+		if len(w.pendingStates) == 0 {
+			return true
 		}
-		samples = w.dropStale(samples)
-		if len(samples) == 0 {
-			return
+		if pendingRecovery != nil || len(w.queue) > 0 || !flush() {
+			return false
 		}
-		if err := w.sender.SendRecoveredStates(ctx, samples); err != nil {
-			if ctx.Err() == nil {
-				markDegraded()
-				log.Printf("remote_write target=%s current state failed: %v", w.cfg.TargetID, err)
+		samples := w.dropStale(w.pendingStates)
+		if len(samples) > 0 {
+			if err := w.sender.SendRecoveredStates(ctx, samples); err != nil {
+				if ctx.Err() == nil {
+					// One line per outage. The recovery line below closes it,
+					// and every slot edge in between reports what is buffered.
+					if degradedSince.IsZero() {
+						log.Printf("remote_write target=%s state samples failed; buffering them until the receiver answers: %v", w.cfg.TargetID, err)
+					}
+					markDegraded()
+				}
+				if !remote_write.IsPermanent(err) {
+					return false
+				}
+			} else {
+				w.noteSamples(samples)
+				if !degradedSince.IsZero() {
+					log.Printf("remote_write target=%s delivery recovered after %s: replayed buffered samples=%d", w.cfg.TargetID, time.Since(degradedSince).Truncate(time.Second), len(samples))
+					degradedSince = time.Time{}
+				}
 			}
-			return
 		}
-		w.noteSamples(samples)
+		w.pendingStates = w.pendingStates[:0]
+		return true
+	}
+	recordStates := func(samples []model.StateSample) bool {
+		// A sample describes the state the engine holds when it is built, so
+		// it stays valid however late it is delivered. While transitions are
+		// still queued the engine is behind the units, and the sample would
+		// instead record a state the moment no longer had.
+		if len(samples) == 0 || pendingRecovery != nil || len(w.queue) > 0 {
+			return false
+		}
+		w.bufferStates(samples, time.Now())
+		return true
 	}
 	heartbeat := func() {
-		// Commands are produced in observation order. Do not let an internal
-		// timer publish a current-time sample ahead of queued transitions or a
-		// recovery job.
-		if len(w.queue) > 0 || !flush() || pendingRecovery != nil {
-			return
+		if recordStates(slotStateSamples(w.cfg.Services, w.cfg.CurrentState, time.Now())) {
+			deliverStates()
 		}
-		if !degradedSince.IsZero() {
-			if time.Since(degradedSince) >= w.cfg.StateInterval && w.cfg.BuildSlotFill != nil {
-				fill, err := w.cfg.BuildSlotFill(ctx)
-				if err != nil {
-					log.Printf("remote_write target=%s recovery republish build failed: %v", w.cfg.TargetID, err)
-					return
-				}
-				if err := w.sender.SendRecoveredStates(ctx, fill); err != nil {
-					log.Printf("remote_write target=%s recovery republish send failed: %v", w.cfg.TargetID, err)
-					if !remote_write.IsPermanent(err) {
-						return
-					}
-				} else {
-					log.Printf("remote_write target=%s delivery recovered: republished samples=%d", w.cfg.TargetID, len(fill))
-				}
-			}
-			degradedSince = time.Time{}
-		}
-		sendCurrent(slotStateSamples(w.cfg.Services, w.cfg.CurrentState, time.Now()))
 	}
 	sendSlotSample := func(at time.Time) bool {
-		if at.IsZero() || pendingRecovery != nil || len(w.queue) > 0 || !flush() {
-			return false
+		if at.IsZero() {
+			return true
 		}
 		samples := slotStateSamples(w.cfg.Services, w.cfg.CurrentState, at)
 		if len(samples) == 0 {
 			return true
 		}
+		if !recordStates(samples) {
+			return false
+		}
 		kind := "closing"
 		if recovery.SlotOpeningTime(recovery.SlotStart(at, w.cfg.RecoveryWindow)).Equal(at) {
 			kind = "opening"
 		}
-		if err := w.sender.SendRecoveredStates(ctx, samples); err != nil {
-			if ctx.Err() == nil {
-				markDegraded()
-				log.Printf("remote_write target=%s slot %s sample failed: %v", w.cfg.TargetID, kind, err)
-			}
-			return remote_write.IsPermanent(err)
+		if deliverStates() {
+			log.Printf("remote_write target=%s slot %s sample at %s samples=%d", w.cfg.TargetID, kind, at.Format(time.RFC3339Nano), len(samples))
+		} else {
+			log.Printf("remote_write target=%s slot %s sample at %s buffered until delivery recovers samples=%d", w.cfg.TargetID, kind, at.Format(time.RFC3339Nano), len(samples))
 		}
-		w.noteSamples(samples)
-		log.Printf("remote_write target=%s slot %s sample at %s samples=%d", w.cfg.TargetID, kind, at.Format(time.RFC3339Nano), len(samples))
 		return true
 	}
 	trySlotSamples := func() {
@@ -351,11 +359,13 @@ func (w *Worker) startup(ctx context.Context) ([]model.Event, time.Time) {
 		}
 		return pending, time.Now()
 	}
-	w.noteEvents(pending[:split])
 	if err := w.sender.SendRecoveredStates(ctx, w.cfg.StartupFill); err != nil {
 		if ctx.Err() == nil {
 			log.Printf("remote_write target=%s startup fill stopped: %v", w.cfg.TargetID, err)
 			degradedSince = time.Now()
+		}
+		if !remote_write.IsPermanent(err) {
+			w.bufferStates(w.cfg.StartupFill, time.Now())
 		}
 	}
 	if err := w.sender.Send(ctx, pending[split:]); err != nil {
@@ -364,14 +374,44 @@ func (w *Worker) startup(ctx context.Context) ([]model.Event, time.Time) {
 		}
 		return pending[split:], time.Now()
 	}
-	w.noteEvents(pending[split:])
 	return nil, degradedSince
 }
 
-// dropStale removes samples that are not newer than the last sample published
-// for the same series. Delivery lag lets a queued availability value reach the
-// receiver after a transition whose timestamp comes from systemd and therefore
-// lies in the past; keeping such a sample would contradict that transition.
+// bufferStates keeps availability samples a receiver has not accepted yet, so
+// a delivery outage can be filled in afterwards instead of leaving a hole in
+// the series.
+func (w *Worker) bufferStates(samples []model.StateSample, now time.Time) {
+	if len(samples) == 0 {
+		return
+	}
+	w.pendingStates = append(w.pendingStates, samples...)
+	w.pruneStates(now)
+}
+
+// pruneStates keeps the backlog inside the current slot. A receiver accepts
+// out-of-order samples only within its configured window, and the exporter
+// never writes into a slot that has already closed.
+func (w *Worker) pruneStates(now time.Time) {
+	if w.cfg.RecoveryWindow > 0 {
+		floor := recovery.SlotStart(now, w.cfg.RecoveryWindow).UnixMilli()
+		kept := w.pendingStates[:0]
+		for _, sample := range w.pendingStates {
+			if sample.TimestampUnixMS >= floor {
+				kept = append(kept, sample)
+			}
+		}
+		w.pendingStates = kept
+	}
+	if excess := len(w.pendingStates) - maxPendingStates; excess > 0 {
+		w.pendingStates = append(w.pendingStates[:0], w.pendingStates[excess:]...)
+	}
+}
+
+// dropStale removes samples that repeat a moment already published for the
+// same series. Transitions are deliberately not part of this bookkeeping: a
+// buffered sample carries the state observed at its own timestamp, so it
+// remains true history even when a later transition reached the receiver
+// first, and the receiver's out-of-order window is what accepts it.
 func (w *Worker) dropStale(samples []model.StateSample) []model.StateSample {
 	out := make([]model.StateSample, 0, len(samples))
 	for _, sample := range samples {
@@ -386,12 +426,6 @@ func (w *Worker) dropStale(samples []model.StateSample) []model.StateSample {
 func (w *Worker) noteSamples(samples []model.StateSample) {
 	for _, sample := range samples {
 		w.notePublished(sample.Service, sample.TimestampUnixMS)
-	}
-}
-
-func (w *Worker) noteEvents(events []model.Event) {
-	for _, event := range events {
-		w.notePublished(event.Service, event.EventTimeUnixMS)
 	}
 }
 

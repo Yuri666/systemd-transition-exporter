@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
+	"github.com/Yuri666/systemd-transition-exporter/internal/recovery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
 )
 
@@ -162,7 +164,7 @@ func TestBothTargetsReceiveSameTransition(t *testing.T) {
 
 func TestDropStaleSkipsSamplesNotNewerThanPublished(t *testing.T) {
 	worker := New(Config{TargetID: "stale"}, &recordingSender{})
-	worker.noteEvents([]model.Event{{Service: "cups.service", EventTimeUnixMS: 2000}})
+	worker.noteSamples([]model.StateSample{{Service: "cups.service", TimestampUnixMS: 2000}})
 	got := worker.dropStale([]model.StateSample{
 		{Service: "cups.service", State: model.StateDown, TimestampUnixMS: 1500},
 		{Service: "cups.service", State: model.StateUp, TimestampUnixMS: 2000},
@@ -177,6 +179,86 @@ func TestDropStaleSkipsSamplesNotNewerThanPublished(t *testing.T) {
 	}
 	if got[1].Service != "other.service" || got[1].TimestampUnixMS != 1000 {
 		t.Fatalf("second kept = %+v, want other.service at 1000", got[1])
+	}
+}
+
+type flakySender struct {
+	mu      sync.Mutex
+	samples []model.StateSample
+	failing atomic.Bool
+}
+
+func (s *flakySender) Send(context.Context, []model.Event) error { return nil }
+
+func (s *flakySender) SendRecoveredStates(_ context.Context, samples []model.StateSample) error {
+	if s.failing.Load() {
+		return errors.New("receiver unavailable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.samples = append(s.samples, samples...)
+	return nil
+}
+
+func (s *flakySender) LastSent() uint64 { return 0 }
+
+func (s *flakySender) delivered() []model.StateSample {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.StateSample(nil), s.samples...)
+}
+
+func TestHeartbeatTicksAreReplayedWhenDeliveryRecovers(t *testing.T) {
+	sender := &flakySender{}
+	sender.failing.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	worker := New(Config{
+		TargetID:       "outage",
+		BatchSize:      10,
+		FlushInterval:  10 * time.Millisecond,
+		StateInterval:  20 * time.Millisecond,
+		RecoveryWindow: time.Hour,
+		Services:       []string{"cups.service"},
+		CurrentState: func(service string) (model.ServiceState, bool) {
+			return model.ServiceState{Service: service, Availability: model.StateUp}, true
+		},
+	}, sender)
+	go worker.Run(ctx)
+
+	time.Sleep(150 * time.Millisecond)
+	if got := sender.delivered(); len(got) != 0 {
+		t.Fatalf("delivered %d samples while the receiver was unavailable", len(got))
+	}
+	outageEnd := time.Now().UnixMilli()
+	sender.failing.Store(false)
+
+	waitFor(t, func() bool { return len(sender.delivered()) >= 3 })
+	replayed := 0
+	for _, sample := range sender.delivered() {
+		if sample.TimestampUnixMS < outageEnd {
+			replayed++
+		}
+	}
+	if replayed < 3 {
+		t.Fatalf("replayed %d samples from the outage, want the buffered ticks", replayed)
+	}
+}
+
+func TestPruneStatesDropsSamplesFromAClosedSlot(t *testing.T) {
+	worker := New(Config{TargetID: "prune", RecoveryWindow: 15 * time.Minute}, &recordingSender{})
+	now := time.Date(2026, 9, 24, 14, 20, 0, 0, time.Local)
+	slotStart := recovery.SlotStart(now, 15*time.Minute)
+	worker.bufferStates([]model.StateSample{
+		{Service: "cups.service", State: model.StateUp, TimestampUnixMS: slotStart.Add(-time.Minute).UnixMilli()},
+		{Service: "cups.service", State: model.StateUp, TimestampUnixMS: slotStart.Add(time.Minute).UnixMilli()},
+	}, now)
+
+	if len(worker.pendingStates) != 1 {
+		t.Fatalf("buffered %d samples, want only the one inside the current slot", len(worker.pendingStates))
+	}
+	if worker.pendingStates[0].TimestampUnixMS != slotStart.Add(time.Minute).UnixMilli() {
+		t.Fatalf("kept %+v, want the sample inside the current slot", worker.pendingStates[0])
 	}
 }
 

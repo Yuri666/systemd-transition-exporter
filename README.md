@@ -152,7 +152,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.4`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `0.9.10`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -368,10 +368,18 @@ receiver, because it missed both transitions and heartbeats:
   current-time sample is published while they are pending;
 - a single delivery attempt is bounded, so the sender never blocks the queue for
   the whole duration of the outage; the batch is retained and retried;
-- when delivery succeeds again, the exporter republishes the current recovery
-  slot from the journal exactly as it does on startup, which restores the
-  continuity of every monitored service — including services that stayed down
-  and would otherwise leave a gap in the graph;
+- heartbeat ticks and slot edges that cannot be delivered are buffered instead
+  of dropped. A sample carries the state observed when it was built, so
+  replaying it later still describes the moment it belongs to;
+- when delivery succeeds again the whole buffer is sent in one request, which
+  fills the outage with the states the exporter actually saw — including
+  services that stayed down and would otherwise leave a gap in the graph. The
+  log reports it as `delivery recovered after 42m0s: replayed buffered
+  samples=…`;
+- the buffer is limited to the current slot. Samples belonging to a slot that
+  closed during the outage are discarded under the same rule that forbids
+  writing into a closed interval, so an outage spanning a slot boundary is
+  filled from the new slot start onwards;
 - a request rejected with HTTP `4xx` is dropped from the send queue instead of
   being retried forever, because an unchanged payload would be rejected again
   and would block every later transition. The events remain in the WAL and
