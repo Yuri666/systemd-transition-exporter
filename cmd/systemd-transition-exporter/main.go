@@ -21,6 +21,7 @@ import (
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 	"github.com/Yuri666/systemd-transition-exporter/internal/recovery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
+	"github.com/Yuri666/systemd-transition-exporter/internal/sip"
 	"github.com/Yuri666/systemd-transition-exporter/internal/systemd"
 	"github.com/Yuri666/systemd-transition-exporter/internal/version"
 	"github.com/Yuri666/systemd-transition-exporter/internal/wal"
@@ -41,6 +42,25 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	units := cfg.Units()
+	var probes []sip.Probe
+	var localIPs []net.IP
+	for _, svc := range cfg.Services {
+		if svc.SIP == "" {
+			continue
+		}
+		if localIPs == nil {
+			localIPs, err = sip.LocalIPs()
+			if err != nil {
+				log.Fatalf("sip probe: %v", err)
+			}
+		}
+		if err := sip.RequireLocal(svc.Addr, localIPs); err != nil {
+			log.Fatalf("sip probe service=%s target=%s: %v", svc.Name, svc.SIP, err)
+		}
+		probes = append(probes, sip.Probe{Service: svc.Name, URI: svc.SIP, Addr: svc.Addr, Interval: svc.Interval})
+		log.Printf("sip probe configured service=%s target=%s interval=%s", svc.Name, svc.SIP, svc.Interval)
+	}
 	hostnames := identity.LocalHostnames()
 	log.Printf("remote_write identity host=%s listen=%s labels=%s", strings.Join(hostnames, ","), cfg.Server.Listen, identity.FormatLabels(cfg.RemoteWrite.Labels))
 	if cfg.RemoteWrite.Enabled {
@@ -58,6 +78,11 @@ func main() {
 	defer stop()
 
 	eng := engine.New()
+	delayed := make([]string, 0, len(probes))
+	for _, probe := range probes {
+		delayed = append(delayed, probe.Service)
+	}
+	eng.DelayUpUntilReady(delayed)
 	reg := metrics.New()
 	reg.SetIdentity(identity.PrimaryHostname(hostnames), cfg.RemoteWrite.Labels["instance"], cfg.Server.Listen)
 	var eventLog *wal.WAL
@@ -118,7 +143,7 @@ func main() {
 		log.Fatalf("read current boot id: %v", err)
 	}
 	bootChanged := false
-	for _, service := range cfg.Services {
+	for _, service := range units {
 		if state, ok := eng.State(service); ok && state.BootID != "" && state.BootID != currentBootID {
 			bootChanged = true
 			break
@@ -146,7 +171,7 @@ func main() {
 			log.Printf("host reboot transition seq=%d service=%s state=%s timestamp_ms=%d", event.Sequence, event.Service, event.State, event.EventTimeUnixMS)
 		}
 		if eventLog != nil {
-			for _, service := range cfg.Services {
+			for _, service := range units {
 				if state, ok := eng.State(service); ok {
 					if e := eventLog.SaveState(state); e != nil {
 						_ = httpListener.Close()
@@ -169,7 +194,7 @@ func main() {
 	}
 	// The monitor is not running yet, so the slot baseline for a first start
 	// with an empty WAL can only come from systemd itself.
-	startupStates, err := systemd.CurrentStates(ctx, cfg.Services)
+	startupStates, err := systemd.CurrentStates(ctx, units)
 	if err != nil {
 		log.Printf("read current unit states for the recovery baseline: %v", err)
 	}
@@ -181,7 +206,7 @@ func main() {
 		startupSlotStart = windowStart
 		reg.RecordRecovery(startupObservedFrom, windowStart, windowEnd)
 		log.Printf("starting journal recovery slot from=%s to=%s", windowStart.Format(time.RFC3339Nano), windowEnd.Format(time.RFC3339Nano))
-		if events, e := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd); e != nil {
+		if events, e := recovery.Recover(ctx, units, windowStart, windowEnd); e != nil {
 			log.Printf("startup journal recovery failed: %v", e)
 		} else {
 			imported := 0
@@ -205,7 +230,7 @@ func main() {
 					log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
 				}
 			}
-			if fill, e := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, startupStates); e != nil {
+			if fill, e := recovery.BuildStateFill(ctx, units, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, startupStates); e != nil {
 				log.Printf("startup recovery fill failed: %v", e)
 			} else {
 				startupFill = fill
@@ -226,8 +251,8 @@ func main() {
 	// Once the monitor is running the engine holds the authoritative current
 	// state, which anchors the beginning of every republished slot.
 	engineStates := func() map[string]model.AvailabilityState {
-		states := make(map[string]model.AvailabilityState, len(cfg.Services))
-		for _, service := range cfg.Services {
+		states := make(map[string]model.AvailabilityState, len(units))
+		for _, service := range units {
 			if state, ok := eng.State(service); ok {
 				states[service] = state.Availability
 			}
@@ -262,7 +287,7 @@ func main() {
 			FlushInterval:  cfg.RemoteWrite.FlushInterval,
 			StateInterval:  cfg.RemoteWrite.StateInterval,
 			RecoveryWindow: cfg.RemoteWrite.RecoveryWindow,
-			Services:       cfg.Services,
+			Services:       units,
 			StartupEvents:  deliveryStartupEvents,
 			StartupFill:    startupFill,
 			StartupSlot:    startupSlotStart,
@@ -312,6 +337,27 @@ func main() {
 	}
 	persist = func(event model.Event) error { return persistEvent(event, true) }
 
+	prober := sip.New(ctx, probes, func(service string, at time.Time) {
+		event, ok := eng.ConfirmReady(service, at)
+		if !ok {
+			return
+		}
+		if err := persist(event); err != nil {
+			log.Printf("sip probe service=%s persist ready: %v", service, err)
+			return
+		}
+		reg.Event(event)
+		log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
+		if eventLog != nil {
+			if state, ok := eng.State(service); ok {
+				if err := eventLog.SaveState(state); err != nil {
+					log.Printf("sip probe service=%s persist state: %v", service, err)
+				}
+			}
+		}
+		reg.SetState(service, model.StateUp)
+	})
+
 	onSnapshot := func(s model.UnitSnapshot) error {
 		for _, event := range eng.Apply(s) {
 			if err := persist(event); err != nil {
@@ -330,6 +376,11 @@ func main() {
 			}
 		}
 		reg.SetState(s.Service, state.Availability)
+		if state.AwaitingSIP {
+			prober.Start(s.Service)
+		} else {
+			prober.Stop(s.Service)
+		}
 		return nil
 	}
 
@@ -340,7 +391,7 @@ func main() {
 		}
 		reg.RecordRecovery(from, windowStart, windowEnd)
 		count := 0
-		events, err := recovery.Recover(ctx, cfg.Services, windowStart, windowEnd)
+		events, err := recovery.Recover(ctx, units, windowStart, windowEnd)
 		if err != nil {
 			return err
 		}
@@ -365,7 +416,7 @@ func main() {
 		}
 
 		if len(targets) > 0 {
-			fill, err := recovery.BuildStateFill(ctx, cfg.Services, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, engineStates())
+			fill, err := recovery.BuildStateFill(ctx, units, windowStart, windowEnd, events, cfg.RemoteWrite.RecoveryFillInterval, engineStates())
 			if err != nil {
 				return err
 			}
@@ -407,7 +458,7 @@ func main() {
 		}
 	}()
 	go func() {
-		err := systemd.RunResilient(ctx, cfg.Services, cfg.Systemd.ReconnectInterval, cfg.Systemd.ReconciliationInterval, onSnapshot, func(connected bool, at time.Time) {
+		err := systemd.RunResilient(ctx, units, cfg.Systemd.ReconnectInterval, cfg.Systemd.ReconciliationInterval, onSnapshot, func(connected bool, at time.Time) {
 			reg.SetDBusConnected(connected, at)
 			if connected {
 				log.Printf("systemd D-Bus connected")

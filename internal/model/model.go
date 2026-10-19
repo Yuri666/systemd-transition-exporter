@@ -46,6 +46,7 @@ const (
 	SourceSystemd EventSource = iota
 	SourceHostReboot
 	SourceRecovery
+	SourceSIP
 )
 
 func (s EventSource) String() string {
@@ -56,6 +57,8 @@ func (s EventSource) String() string {
 		return "host_reboot"
 	case SourceRecovery:
 		return "recovery"
+	case SourceSIP:
+		return "sip"
 	default:
 		return "unknown"
 	}
@@ -104,4 +107,7 @@ type ServiceState struct {
 	LastEventTimeUnixMS        int64
 	LastEventMonoUS            uint64
 	LastSequence               uint64
+	// AwaitingSIP is set while systemd has reached active and the UP
+	// transition is held back until the configured SIP interface answers.
+	AwaitingSIP bool
 }

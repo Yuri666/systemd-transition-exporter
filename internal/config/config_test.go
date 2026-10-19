@@ -105,6 +105,48 @@ func TestWithListenPortKeepsHost(t *testing.T) {
 	}
 }
 
+func TestServicesAcceptPlainUnitsAndSIPProbes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("services:\n  - pcscf.service\n  - name: scscf.service\n    sip: sip:10.12.12.10:5060\n    interval: 700ms\n  - name: icscf.service\n    sip: sip:10.12.12.11:5060\n    interval: 1000\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Units(); len(got) != 3 || got[0] != "pcscf.service" || got[2] != "icscf.service" {
+		t.Fatalf("units = %v", got)
+	}
+	scscf := cfg.Services[1]
+	if scscf.SIP != "sip:10.12.12.10:5060" || scscf.Addr != "10.12.12.10:5060" || scscf.Interval != 700*time.Millisecond {
+		t.Fatalf("scscf probe = %+v", scscf)
+	}
+	if cfg.Services[2].Interval != time.Second {
+		t.Fatalf("icscf interval = %s, want 1s", cfg.Services[2].Interval)
+	}
+	if cfg.Services[0].SIP != "" {
+		t.Fatalf("plain unit gained a probe: %+v", cfg.Services[0])
+	}
+}
+
+func TestServicesRejectIncompleteProbe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	for _, body := range []string{
+		"services:\n  - name: scscf.service\n    sip: sip:10.12.12.10:5060\n",
+		"services:\n  - name: scscf.service\n    interval: 700ms\n",
+		"services:\n  - scscf.service sip:10.12.12.10:5060 700\n",
+		"services:\n  - name: scscf.service\n    sip: sip:10.12.12.10:5060;transport=tcp\n    interval: 700ms\n",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("config accepted:\n%s", body)
+		}
+	}
+}
+
 func TestWithListenPortRejectsOutOfRange(t *testing.T) {
 	if _, err := WithListenPort("127.0.0.1:9877", 0); err == nil {
 		t.Fatal("port 0 unexpectedly accepted")

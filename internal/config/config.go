@@ -14,10 +14,66 @@ import (
 
 type Config struct {
 	Server      ServerConfig      `yaml:"server"`
-	Services    []string          `yaml:"services"`
+	Services    []Service         `yaml:"services"`
 	Systemd     SystemdConfig     `yaml:"systemd"`
 	WAL         WALConfig         `yaml:"wal"`
 	RemoteWrite RemoteWriteConfig `yaml:"remote_write"`
+}
+
+// Service is one monitored systemd unit. A SIP target delays the UP transition
+// until that interface answers OPTIONS with 200; a unit without one is tracked
+// from systemd alone.
+type Service struct {
+	Name     string
+	SIP      string
+	Addr     string
+	Interval time.Duration
+}
+
+func (s *Service) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		s.Name = strings.TrimSpace(value.Value)
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("service must be a unit name or a name/sip/interval mapping")
+	}
+	var raw struct {
+		Name     string     `yaml:"name"`
+		SIP      string     `yaml:"sip"`
+		Interval probeEvery `yaml:"interval"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*s = Service{Name: strings.TrimSpace(raw.Name), SIP: strings.TrimSpace(raw.SIP), Interval: time.Duration(raw.Interval)}
+	return nil
+}
+
+// probeEvery accepts a Go duration (700ms) or a bare number of milliseconds,
+// which is the unit the probe interval is configured in.
+type probeEvery time.Duration
+
+func (p *probeEvery) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("interval must be a duration or a number of milliseconds")
+	}
+	switch value.Tag {
+	case "!!int", "!!float":
+		n, err := strconv.ParseFloat(value.Value, 64)
+		if err != nil {
+			return fmt.Errorf("interval %q: %w", value.Value, err)
+		}
+		*p = probeEvery(time.Duration(n * float64(time.Millisecond)))
+		return nil
+	default:
+		d, err := time.ParseDuration(strings.TrimSpace(value.Value))
+		if err != nil {
+			return fmt.Errorf("interval %q: %w", value.Value, err)
+		}
+		*p = probeEvery(d)
+		return nil
+	}
 }
 
 type ServerConfig struct {
@@ -80,6 +136,32 @@ func Load(path string) (Config, error) {
 	}
 	if len(c.Services) == 0 {
 		return Config{}, fmt.Errorf("services must contain at least one systemd unit")
+	}
+	seen := make(map[string]struct{}, len(c.Services))
+	for i := range c.Services {
+		svc := &c.Services[i]
+		if svc.Name == "" || strings.ContainsAny(svc.Name, " \t") {
+			return Config{}, fmt.Errorf("services[%d] must name a systemd unit", i)
+		}
+		if _, ok := seen[svc.Name]; ok {
+			return Config{}, fmt.Errorf("services contains duplicate unit %q", svc.Name)
+		}
+		seen[svc.Name] = struct{}{}
+		if svc.SIP == "" {
+			if svc.Interval != 0 {
+				return Config{}, fmt.Errorf("services[%d] interval requires sip", i)
+			}
+			continue
+		}
+		if svc.Interval <= 0 {
+			return Config{}, fmt.Errorf("services[%d] sip probe requires a positive interval", i)
+		}
+		uri, addr, err := parseSIPTarget(svc.SIP)
+		if err != nil {
+			return Config{}, fmt.Errorf("services[%d]: %w", i, err)
+		}
+		svc.SIP = uri
+		svc.Addr = addr
 	}
 	// Recovery also protects D-Bus reconnects and host-reboot handling, so its
 	// slot size must be valid even when Remote Write delivery is disabled.
@@ -166,6 +248,42 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+// Units returns the systemd unit names in configuration order.
+func (c Config) Units() []string {
+	names := make([]string, len(c.Services))
+	for i, svc := range c.Services {
+		names[i] = svc.Name
+	}
+	return names
+}
+
+// parseSIPTarget accepts sip:host:port. UDP is the only transport, so a
+// transport parameter is rejected rather than ignored.
+func parseSIPTarget(raw string) (uri, addr string, err error) {
+	raw = strings.TrimSpace(raw)
+	const prefix = "sip:"
+	if len(raw) < len(prefix) || !strings.EqualFold(raw[:len(prefix)], prefix) {
+		return "", "", fmt.Errorf("sip target %q must start with sip:", raw)
+	}
+	rest := raw[len(prefix):]
+	if strings.ContainsAny(rest, ";?") || strings.Contains(rest, "@") {
+		return "", "", fmt.Errorf("sip target %q accepts host and port only", raw)
+	}
+	host, port, err := net.SplitHostPort(rest)
+	if err != nil {
+		return "", "", fmt.Errorf("sip target %q: %w", raw, err)
+	}
+	if host == "" {
+		return "", "", fmt.Errorf("sip target %q has an empty host", raw)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", "", fmt.Errorf("sip target %q has an invalid port", raw)
+	}
+	addr = net.JoinHostPort(host, port)
+	return "sip:" + addr, addr, nil
 }
 
 // WithListenPort replaces the TCP port in a host:port listen address. The host

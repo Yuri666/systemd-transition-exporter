@@ -108,6 +108,75 @@ func TestHostRebootMarksPreviouslyUpServiceDown(t *testing.T) {
 	}
 }
 
+func TestProbeHoldsUpUntilReady(t *testing.T) {
+	e := New()
+	e.DelayUpUntilReady([]string{"scscf.service"})
+	if got := e.Apply(snapshot("scscf.service", "active", 1000, 0)); len(got) != 0 {
+		t.Fatalf("already active unit started a probe: %+v", got)
+	}
+	state, _ := e.State("scscf.service")
+	if state.Availability != model.StateUp || state.AwaitingSIP {
+		t.Fatalf("initial active state = %+v, want up and not awaiting", state)
+	}
+
+	e.Apply(snapshot("scscf.service", "inactive", 1000, 2000))
+	got := e.Apply(snapshot("scscf.service", "active", 3000, 2000))
+	if len(got) != 0 {
+		t.Fatalf("activation emitted %+v before the SIP answer", got)
+	}
+	state, _ = e.State("scscf.service")
+	if state.Availability != model.StateDown || !state.AwaitingSIP {
+		t.Fatalf("while probing = %+v, want down and awaiting", state)
+	}
+
+	readyAt := time.UnixMilli(3500)
+	event, ok := e.ConfirmReady("scscf.service", readyAt)
+	if !ok || event.State != model.StateUp || event.Source != model.SourceSIP || event.EventTimeUnixMS != readyAt.UnixMilli() {
+		t.Fatalf("ready event = %+v ok=%t", event, ok)
+	}
+	state, _ = e.State("scscf.service")
+	if state.Availability != model.StateUp || state.AwaitingSIP {
+		t.Fatalf("after ready = %+v", state)
+	}
+	if _, again := e.ConfirmReady("scscf.service", readyAt.Add(time.Second)); again {
+		t.Fatal("second answer was accepted")
+	}
+}
+
+func TestProbeRestartEmitsDownAndWaits(t *testing.T) {
+	e := New()
+	e.DelayUpUntilReady([]string{"scscf.service"})
+	e.Apply(snapshot("scscf.service", "active", 1000, 0))
+	got := e.Apply(snapshot("scscf.service", "active", 4000, 3000))
+	if len(got) != 1 || got[0].State != model.StateDown || got[0].EventTimeUnixMS != 3 {
+		t.Fatalf("restart events = %+v, want only the stop", got)
+	}
+	state, _ := e.State("scscf.service")
+	if state.Availability != model.StateDown || !state.AwaitingSIP {
+		t.Fatalf("after restart = %+v, want down and awaiting", state)
+	}
+}
+
+func TestProbeStopBeforeAnswerEmitsNothing(t *testing.T) {
+	e := New()
+	e.DelayUpUntilReady([]string{"scscf.service"})
+	e.Apply(snapshot("scscf.service", "inactive", 1000, 0))
+	if got := e.Apply(snapshot("scscf.service", "active", 2000, 0)); len(got) != 0 {
+		t.Fatalf("activation emitted %+v", got)
+	}
+	got := e.Apply(snapshot("scscf.service", "inactive", 2000, 3000))
+	if len(got) != 0 {
+		t.Fatalf("stop before the answer emitted %+v", got)
+	}
+	state, _ := e.State("scscf.service")
+	if state.AwaitingSIP || state.Availability != model.StateDown {
+		t.Fatalf("after abandoned probe = %+v", state)
+	}
+	if _, ok := e.ConfirmReady("scscf.service", time.UnixMilli(4000)); ok {
+		t.Fatal("answer accepted after the unit stopped")
+	}
+}
+
 func TestHostRebootDoesNotEmitForAlreadyDownService(t *testing.T) {
 	e := New()
 	e.RestoreState(model.ServiceState{

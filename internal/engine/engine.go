@@ -9,9 +9,22 @@ import (
 )
 
 type Engine struct {
-	mu     sync.Mutex
-	states map[string]model.ServiceState
-	seq    uint64
+	mu      sync.Mutex
+	states  map[string]model.ServiceState
+	seq     uint64
+	delayUp map[string]struct{}
+}
+
+// DelayUpUntilReady holds the UP transition of each named service until
+// ConfirmReady. The first observation of an already active unit is unaffected:
+// a probe starts only from a transition seen while this process is running.
+func (e *Engine) DelayUpUntilReady(services []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.delayUp = make(map[string]struct{}, len(services))
+	for _, service := range services {
+		e.delayUp[service] = struct{}{}
+	}
 }
 
 func New() *Engine { return &Engine{states: make(map[string]model.ServiceState)} }
@@ -49,6 +62,7 @@ func (e *Engine) Replay(event model.Event) {
 		return
 	}
 	state.Availability = event.State
+	state.AwaitingSIP = false
 	state.BootID = event.BootID
 	state.LastEventTimeUnixMS = event.EventTimeUnixMS
 	state.LastEventMonoUS = event.EventTimeMonotonicUS
@@ -64,12 +78,15 @@ func (e *Engine) Replay(event model.Event) {
 func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	newState := availability(s.ActiveState)
+	observed := availability(s.ActiveState)
 	old, exists := e.states[s.Service]
 	if !exists || old.BootID != s.BootID {
-		e.states[s.Service] = model.ServiceState{Service: s.Service, Availability: newState, ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID, LastActiveEnterTimestampUS: s.ActiveEnterTimestampUS, LastActiveExitTimestampUS: s.ActiveExitTimestampUS, LastActiveEnterMonotonicUS: s.ActiveEnterTimestampMonotonicUS, LastActiveExitMonotonicUS: s.ActiveExitTimestampMonotonicUS, LastEventTimeUnixMS: old.LastEventTimeUnixMS, LastEventMonoUS: old.LastEventMonoUS, LastSequence: old.LastSequence}
+		// First look at this boot. An already active unit counts as up; the
+		// SIP probe waits for a later transition, which this snapshot is not.
+		e.states[s.Service] = model.ServiceState{Service: s.Service, Availability: observed, ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID, LastActiveEnterTimestampUS: s.ActiveEnterTimestampUS, LastActiveExitTimestampUS: s.ActiveExitTimestampUS, LastActiveEnterMonotonicUS: s.ActiveEnterTimestampMonotonicUS, LastActiveExitMonotonicUS: s.ActiveExitTimestampMonotonicUS, LastEventTimeUnixMS: old.LastEventTimeUnixMS, LastEventMonoUS: old.LastEventMonoUS, LastSequence: old.LastSequence}
 		return nil
 	}
+	_, delayUp := e.delayUp[s.Service]
 	type candidate struct {
 		state          model.AvailabilityState
 		unixUS, monoUS uint64
@@ -82,12 +99,31 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 		candidates = append(candidates, candidate{model.StateUp, s.ActiveEnterTimestampUS, s.ActiveEnterTimestampMonotonicUS})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].unixUS < candidates[j].unixUS })
+	current := old.Availability
+	pending := old.AwaitingSIP
 	events := make([]model.Event, 0, len(candidates))
 	for _, c := range candidates {
+		if c.state == model.StateUp && delayUp {
+			pending = true
+			continue
+		}
+		if c.state == model.StateDown {
+			// The matching UP was withheld, so the series is already down and
+			// a stop before the first 200 does not add another transition.
+			wasPending := pending
+			pending = false
+			if wasPending && current == model.StateDown {
+				continue
+			}
+		}
 		e.seq++
 		events = append(events, model.Event{Sequence: e.seq, Service: s.Service, State: c.state, EventTimeUnixMS: int64(c.unixUS / 1000), EventTimeMonotonicUS: c.monoUS, BootID: s.BootID, Source: model.SourceSystemd, SystemdActiveState: s.ActiveState, SystemdSubState: s.SubState})
+		current = c.state
 	}
-	updated := model.ServiceState{Service: s.Service, Availability: newState, ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID, LastActiveEnterTimestampUS: s.ActiveEnterTimestampUS, LastActiveExitTimestampUS: s.ActiveExitTimestampUS, LastActiveEnterMonotonicUS: s.ActiveEnterTimestampMonotonicUS, LastActiveExitMonotonicUS: s.ActiveExitTimestampMonotonicUS, LastEventTimeUnixMS: old.LastEventTimeUnixMS, LastEventMonoUS: old.LastEventMonoUS, LastSequence: old.LastSequence}
+	updated := model.ServiceState{Service: s.Service, Availability: observed, ActiveState: s.ActiveState, SubState: s.SubState, BootID: s.BootID, LastActiveEnterTimestampUS: s.ActiveEnterTimestampUS, LastActiveExitTimestampUS: s.ActiveExitTimestampUS, LastActiveEnterMonotonicUS: s.ActiveEnterTimestampMonotonicUS, LastActiveExitMonotonicUS: s.ActiveExitTimestampMonotonicUS, LastEventTimeUnixMS: old.LastEventTimeUnixMS, LastEventMonoUS: old.LastEventMonoUS, LastSequence: old.LastSequence, AwaitingSIP: pending}
+	if pending {
+		updated.Availability = model.StateDown
+	}
 	if len(events) > 0 {
 		last := events[len(events)-1]
 		updated.LastEventTimeUnixMS = last.EventTimeUnixMS
@@ -96,6 +132,38 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	}
 	e.states[s.Service] = updated
 	return events
+}
+
+// ConfirmReady releases the withheld UP transition at the moment the SIP
+// interface answered. A late answer, after the unit left active, is discarded.
+func (e *Engine) ConfirmReady(service string, at time.Time) (model.Event, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state, ok := e.states[service]
+	if !ok || !state.AwaitingSIP {
+		return model.Event{}, false
+	}
+	ts := at.UnixMilli()
+	if ts <= state.LastEventTimeUnixMS {
+		ts = state.LastEventTimeUnixMS + 1
+	}
+	e.seq++
+	event := model.Event{
+		Sequence:           e.seq,
+		Service:            service,
+		State:              model.StateUp,
+		EventTimeUnixMS:    ts,
+		BootID:             state.BootID,
+		Source:             model.SourceSIP,
+		SystemdActiveState: state.ActiveState,
+		SystemdSubState:    state.SubState,
+	}
+	state.AwaitingSIP = false
+	state.Availability = model.StateUp
+	state.LastEventTimeUnixMS = event.EventTimeUnixMS
+	state.LastSequence = event.Sequence
+	e.states[service] = state
+	return event, true
 }
 
 func (e *Engine) ApplyRecovery(event model.Event) []model.Event {
@@ -112,6 +180,7 @@ func (e *Engine) ApplyRecovery(event model.Event) []model.Event {
 	event.Sequence = e.seq
 	state.Service = event.Service
 	state.Availability = event.State
+	state.AwaitingSIP = false
 	state.BootID = event.BootID
 	state.LastEventTimeUnixMS = event.EventTimeUnixMS
 	state.LastSequence = event.Sequence
