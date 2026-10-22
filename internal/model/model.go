@@ -47,6 +47,7 @@ const (
 	SourceHostReboot
 	SourceRecovery
 	SourceSIP
+	SourceDNS
 )
 
 func (s EventSource) String() string {
@@ -59,6 +60,8 @@ func (s EventSource) String() string {
 		return "recovery"
 	case SourceSIP:
 		return "sip"
+	case SourceDNS:
+		return "dns"
 	default:
 		return "unknown"
 	}

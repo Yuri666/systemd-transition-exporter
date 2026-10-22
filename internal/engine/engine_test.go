@@ -130,7 +130,7 @@ func TestProbeHoldsUpUntilReady(t *testing.T) {
 	}
 
 	readyAt := time.UnixMilli(3500)
-	event, ok := e.ConfirmReady("scscf.service", readyAt)
+	event, ok := e.ConfirmReady("scscf.service", readyAt, model.SourceSIP)
 	if !ok || event.State != model.StateUp || event.Source != model.SourceSIP || event.EventTimeUnixMS != readyAt.UnixMilli() {
 		t.Fatalf("ready event = %+v ok=%t", event, ok)
 	}
@@ -138,7 +138,7 @@ func TestProbeHoldsUpUntilReady(t *testing.T) {
 	if state.Availability != model.StateUp || state.AwaitingSIP {
 		t.Fatalf("after ready = %+v", state)
 	}
-	if _, again := e.ConfirmReady("scscf.service", readyAt.Add(time.Second)); again {
+	if _, again := e.ConfirmReady("scscf.service", readyAt.Add(time.Second), model.SourceSIP); again {
 		t.Fatal("second answer was accepted")
 	}
 }
@@ -172,7 +172,7 @@ func TestProbeStopBeforeAnswerEmitsNothing(t *testing.T) {
 	if state.AwaitingSIP || state.Availability != model.StateDown {
 		t.Fatalf("after abandoned probe = %+v", state)
 	}
-	if _, ok := e.ConfirmReady("scscf.service", time.UnixMilli(4000)); ok {
+	if _, ok := e.ConfirmReady("scscf.service", time.UnixMilli(4000), model.SourceSIP); ok {
 		t.Fatal("answer accepted after the unit stopped")
 	}
 }

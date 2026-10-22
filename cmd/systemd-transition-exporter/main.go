@@ -15,6 +15,7 @@ import (
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/config"
 	"github.com/Yuri666/systemd-transition-exporter/internal/delivery"
+	"github.com/Yuri666/systemd-transition-exporter/internal/dns"
 	"github.com/Yuri666/systemd-transition-exporter/internal/engine"
 	"github.com/Yuri666/systemd-transition-exporter/internal/identity"
 	"github.com/Yuri666/systemd-transition-exporter/internal/metrics"
@@ -43,23 +44,36 @@ func main() {
 		}
 	}
 	units := cfg.Units()
-	var probes []sip.Probe
+	var sipProbes []sip.Probe
+	var dnsProbes []dns.Probe
 	var localIPs []net.IP
 	for _, svc := range cfg.Services {
-		if svc.SIP == "" {
+		target := svc.SIP
+		kind := "sip"
+		if svc.DNS != "" {
+			target = svc.DNS
+			kind = "dns"
+		}
+		if target == "" {
 			continue
 		}
 		if localIPs == nil {
 			localIPs, err = sip.LocalIPs()
 			if err != nil {
-				log.Fatalf("sip probe: %v", err)
+				log.Fatalf("%s probe: %v", kind, err)
 			}
 		}
 		if err := sip.RequireLocal(svc.Addr, localIPs); err != nil {
-			log.Fatalf("sip probe service=%s target=%s: %v", svc.Name, svc.SIP, err)
+			log.Fatalf("%s probe service=%s target=%s: %v", kind, svc.Name, target, err)
 		}
-		probes = append(probes, sip.Probe{Service: svc.Name, URI: svc.SIP, Addr: svc.Addr, Interval: svc.Interval})
-		log.Printf("sip probe configured service=%s target=%s interval=%s", svc.Name, svc.SIP, svc.Interval)
+		switch kind {
+		case "sip":
+			sipProbes = append(sipProbes, sip.Probe{Service: svc.Name, URI: svc.SIP, Addr: svc.Addr, Interval: svc.Interval})
+			log.Printf("sip probe configured service=%s target=%s interval=%s", svc.Name, svc.SIP, svc.Interval)
+		default:
+			dnsProbes = append(dnsProbes, dns.Probe{Service: svc.Name, URI: svc.DNS, Addr: svc.Addr, Interval: svc.Interval})
+			log.Printf("dns probe configured service=%s target=%s query=CH/TXT version.bind interval=%s", svc.Name, svc.DNS, svc.Interval)
+		}
 	}
 	hostnames := identity.LocalHostnames()
 	log.Printf("remote_write identity host=%s listen=%s labels=%s", strings.Join(hostnames, ","), cfg.Server.Listen, identity.FormatLabels(cfg.RemoteWrite.Labels))
@@ -78,8 +92,11 @@ func main() {
 	defer stop()
 
 	eng := engine.New()
-	delayed := make([]string, 0, len(probes))
-	for _, probe := range probes {
+	delayed := make([]string, 0, len(sipProbes)+len(dnsProbes))
+	for _, probe := range sipProbes {
+		delayed = append(delayed, probe.Service)
+	}
+	for _, probe := range dnsProbes {
 		delayed = append(delayed, probe.Service)
 	}
 	eng.DelayUpUntilReady(delayed)
@@ -337,13 +354,13 @@ func main() {
 	}
 	persist = func(event model.Event) error { return persistEvent(event, true) }
 
-	prober := sip.New(ctx, probes, func(service string, at time.Time) {
-		event, ok := eng.ConfirmReady(service, at)
+	publishReady := func(service string, at time.Time, source model.EventSource) {
+		event, ok := eng.ConfirmReady(service, at, source)
 		if !ok {
 			return
 		}
 		if err := persist(event); err != nil {
-			log.Printf("sip probe service=%s persist ready: %v", service, err)
+			log.Printf("probe service=%s persist ready: %v", service, err)
 			return
 		}
 		reg.Event(event)
@@ -351,11 +368,17 @@ func main() {
 		if eventLog != nil {
 			if state, ok := eng.State(service); ok {
 				if err := eventLog.SaveState(state); err != nil {
-					log.Printf("sip probe service=%s persist state: %v", service, err)
+					log.Printf("probe service=%s persist state: %v", service, err)
 				}
 			}
 		}
 		reg.SetState(service, model.StateUp)
+	}
+	sipProber := sip.New(ctx, sipProbes, func(service string, at time.Time) {
+		publishReady(service, at, model.SourceSIP)
+	})
+	dnsProber := dns.New(ctx, dnsProbes, func(service string, at time.Time) {
+		publishReady(service, at, model.SourceDNS)
 	})
 
 	onSnapshot := func(s model.UnitSnapshot) error {
@@ -377,9 +400,11 @@ func main() {
 		}
 		reg.SetState(s.Service, state.Availability)
 		if state.AwaitingSIP {
-			prober.Start(s.Service)
+			sipProber.Start(s.Service)
+			dnsProber.Start(s.Service)
 		} else {
-			prober.Stop(s.Service)
+			sipProber.Stop(s.Service)
+			dnsProber.Stop(s.Service)
 		}
 		return nil
 	}

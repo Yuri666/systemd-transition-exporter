@@ -20,12 +20,13 @@ type Config struct {
 	RemoteWrite RemoteWriteConfig `yaml:"remote_write"`
 }
 
-// Service is one monitored systemd unit. A SIP target delays the UP transition
-// until that interface answers OPTIONS with 200; a unit without one is tracked
-// from systemd alone.
+// Service is one monitored systemd unit. A SIP or DNS target delays the UP
+// transition until that local interface answers; a unit without one is tracked
+// from systemd alone. A service has at most one of SIP and DNS.
 type Service struct {
 	Name     string
 	SIP      string
+	DNS      string
 	Addr     string
 	Interval time.Duration
 }
@@ -36,17 +37,18 @@ func (s *Service) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	}
 	if value.Kind != yaml.MappingNode {
-		return fmt.Errorf("service must be a unit name or a name/sip/interval mapping")
+		return fmt.Errorf("service must be a unit name or a mapping with name, interval and sip or dns")
 	}
 	var raw struct {
 		Name     string     `yaml:"name"`
 		SIP      string     `yaml:"sip"`
+		DNS      string     `yaml:"dns"`
 		Interval probeEvery `yaml:"interval"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
 	}
-	*s = Service{Name: strings.TrimSpace(raw.Name), SIP: strings.TrimSpace(raw.SIP), Interval: time.Duration(raw.Interval)}
+	*s = Service{Name: strings.TrimSpace(raw.Name), SIP: strings.TrimSpace(raw.SIP), DNS: strings.TrimSpace(raw.DNS), Interval: time.Duration(raw.Interval)}
 	return nil
 }
 
@@ -147,20 +149,31 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("services contains duplicate unit %q", svc.Name)
 		}
 		seen[svc.Name] = struct{}{}
-		if svc.SIP == "" {
+		if svc.SIP != "" && svc.DNS != "" {
+			return Config{}, fmt.Errorf("services[%d] has both sip and dns", i)
+		}
+		target, scheme := svc.SIP, "sip"
+		if svc.DNS != "" {
+			target, scheme = svc.DNS, "dns"
+		}
+		if target == "" {
 			if svc.Interval != 0 {
-				return Config{}, fmt.Errorf("services[%d] interval requires sip", i)
+				return Config{}, fmt.Errorf("services[%d] interval requires sip or dns", i)
 			}
 			continue
 		}
 		if svc.Interval <= 0 {
-			return Config{}, fmt.Errorf("services[%d] sip probe requires a positive interval", i)
+			return Config{}, fmt.Errorf("services[%d] %s probe requires a positive interval", i, scheme)
 		}
-		uri, addr, err := parseSIPTarget(svc.SIP)
+		uri, addr, err := parseProbeTarget(target, scheme)
 		if err != nil {
 			return Config{}, fmt.Errorf("services[%d]: %w", i, err)
 		}
-		svc.SIP = uri
+		if scheme == "sip" {
+			svc.SIP = uri
+		} else {
+			svc.DNS = uri
+		}
 		svc.Addr = addr
 	}
 	// Recovery also protects D-Bus reconnects and host-reboot handling, so its
@@ -259,31 +272,31 @@ func (c Config) Units() []string {
 	return names
 }
 
-// parseSIPTarget accepts sip:host:port. UDP is the only transport, so a
-// transport parameter is rejected rather than ignored.
-func parseSIPTarget(raw string) (uri, addr string, err error) {
+// parseProbeTarget accepts sip:host:port or dns:host:port. UDP is the only
+// transport, so a transport parameter is rejected rather than ignored.
+func parseProbeTarget(raw, scheme string) (uri, addr string, err error) {
 	raw = strings.TrimSpace(raw)
-	const prefix = "sip:"
+	prefix := scheme + ":"
 	if len(raw) < len(prefix) || !strings.EqualFold(raw[:len(prefix)], prefix) {
-		return "", "", fmt.Errorf("sip target %q must start with sip:", raw)
+		return "", "", fmt.Errorf("%s target %q must start with %s", scheme, raw, prefix)
 	}
 	rest := raw[len(prefix):]
 	if strings.ContainsAny(rest, ";?") || strings.Contains(rest, "@") {
-		return "", "", fmt.Errorf("sip target %q accepts host and port only", raw)
+		return "", "", fmt.Errorf("%s target %q accepts host and port only", scheme, raw)
 	}
 	host, port, err := net.SplitHostPort(rest)
 	if err != nil {
-		return "", "", fmt.Errorf("sip target %q: %w", raw, err)
+		return "", "", fmt.Errorf("%s target %q: %w", scheme, raw, err)
 	}
 	if host == "" {
-		return "", "", fmt.Errorf("sip target %q has an empty host", raw)
+		return "", "", fmt.Errorf("%s target %q has an empty host", scheme, raw)
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return "", "", fmt.Errorf("sip target %q has an invalid port", raw)
+		return "", "", fmt.Errorf("%s target %q has an invalid port", scheme, raw)
 	}
 	addr = net.JoinHostPort(host, port)
-	return "sip:" + addr, addr, nil
+	return scheme + ":" + addr, addr, nil
 }
 
 // WithListenPort replaces the TCP port in a host:port listen address. The host

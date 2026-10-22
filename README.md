@@ -32,7 +32,7 @@ any other ActiveState           -> DOWN
 
 In particular, `inactive`, `activating`, `deactivating`, `failed`, `reloading`, `maintenance`, and `unknown` are DOWN.
 
-A service can additionally name a SIP interface. After a transition to `active` that this process observes, that service stays DOWN and the exporter sends SIP OPTIONS until the first `200` arrives. The time of that response is the UP transition, and probing then stops. A unit that is already active when the exporter starts is UP immediately and is not probed. The exporter refuses to start when the address in `sip` is not assigned to a local interface. Journal recovery keeps the systemd `Started` time: the journal has no record of the SIP answer.
+A service can additionally name a local SIP or DNS interface. After a transition to `active` that this process observes, that service stays DOWN until the probe answers. The time of that answer is the UP transition, and probing then stops. SIP sends OPTIONS and waits for `200`. DNS, used for `named` on the same host, sends one UDP query, `CH TXT version.bind`: named answers that itself, so the check does not wait on recursion or on a zone name. Any DNS response counts, including `REFUSED` from a server that hides the chaos class. A unit that is already active when the exporter starts is UP immediately and is not probed. The exporter refuses to start when the probe address is not assigned to a local interface. Journal recovery keeps the systemd `Started` time: the journal has no record of the probe answer.
 
 ## Current implementation status
 
@@ -154,7 +154,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `1.0.0`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `1.0.1`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -173,6 +173,9 @@ services:
   - name: icscf.service
     sip: sip:10.12.12.11:5060
     interval: 1000ms
+  - name: named.service
+    dns: dns:10.10.12.12:53
+    interval: 200ms
 
 systemd:
   reconnect_interval: 1s
@@ -207,7 +210,7 @@ remote_write:
 The TCP port is set from the command line with `--web.listen-port`; that flag
 replaces the port in `server.listen` and leaves the host unchanged. Without the
 flag the address from the file is used, defaulting to `127.0.0.1:9877`.
-`server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. An entry is either a unit name or a mapping with `name`, `sip` (`sip:host:port`, UDP; the host must be an address of this machine) and `interval` (`700ms`, or a bare number of milliseconds). The interval is both the OPTIONS period and the timeout of one request; the next request waits out the interval and does not overlap the previous one. Only the response code 200 counts. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
+`server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. An entry is either a unit name or a mapping with `name`, one of `sip` (`sip:host:port`) or `dns` (`dns:host:port`), and `interval` (`700ms`, or a bare number of milliseconds). The host must be an address of this machine. The interval is both the period and the timeout of one UDP request; the next request waits out the interval and does not overlap the previous one. SIP accepts only response code 200. DNS accepts any response to `CH TXT version.bind`. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
 
 `wal.enabled`, `wal.directory` and `wal.fsync` control the durable collector event log. The WAL file is `<wal.directory>/events.jsonl`.
 

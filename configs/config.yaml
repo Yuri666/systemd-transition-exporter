@@ -9,11 +9,14 @@ services:
   - pcscf.service
   - scscf.service
   - icscf.service
-  # A SIP target delays this unit's UP transition until the first OPTIONS 200.
+  # A probe delays this unit's UP transition until the local interface answers.
   # interval is the send period and the per-request timeout.
   # - name: scscf.service
   #   sip: sip:10.12.12.10:5060
   #   interval: 700ms
+  # - name: named.service
+  #   dns: dns:10.10.12.12:53
+  #   interval: 200ms
 
 systemd:
   reconnect_interval: 1s

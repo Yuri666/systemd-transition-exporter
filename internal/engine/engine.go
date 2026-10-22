@@ -134,9 +134,10 @@ func (e *Engine) Apply(s model.UnitSnapshot) []model.Event {
 	return events
 }
 
-// ConfirmReady releases the withheld UP transition at the moment the SIP
-// interface answered. A late answer, after the unit left active, is discarded.
-func (e *Engine) ConfirmReady(service string, at time.Time) (model.Event, bool) {
+// ConfirmReady releases the withheld UP transition at the moment the probe
+// answered. source is sip or dns. A late answer, after the unit left active,
+// is discarded.
+func (e *Engine) ConfirmReady(service string, at time.Time, source model.EventSource) (model.Event, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	state, ok := e.states[service]
@@ -154,7 +155,7 @@ func (e *Engine) ConfirmReady(service string, at time.Time) (model.Event, bool) 
 		State:              model.StateUp,
 		EventTimeUnixMS:    ts,
 		BootID:             state.BootID,
-		Source:             model.SourceSIP,
+		Source:             source,
 		SystemdActiveState: state.ActiveState,
 		SystemdSubState:    state.SubState,
 	}
