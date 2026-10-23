@@ -107,7 +107,7 @@ func TestWithListenPortKeepsHost(t *testing.T) {
 
 func TestServicesAcceptPlainUnitsAndSIPProbes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("services:\n  - pcscf.service\n  - name: scscf.service\n    sip: sip:10.12.12.10:5060\n    interval: 700ms\n  - name: named.service\n    dns: dns:10.10.12.12:53\n    interval: 200ms\n")
+	data := []byte("services:\n  - pcscf.service\n  - name: scscf.service\n    sip: sip:10.12.12.10:5060\n    interval: 700ms\n  - name: named.service\n    dns: dns:10.10.12.12:53\n    interval: 200ms\n  - name: agw.service\n    agw: agw:10.10.12.12:7722\n    interval: 500ms\n")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestServicesAcceptPlainUnitsAndSIPProbes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Units(); len(got) != 3 || got[0] != "pcscf.service" || got[2] != "named.service" {
+	if got := cfg.Units(); len(got) != 4 || got[0] != "pcscf.service" || got[2] != "named.service" {
 		t.Fatalf("units = %v", got)
 	}
 	scscf := cfg.Services[1]
@@ -125,6 +125,10 @@ func TestServicesAcceptPlainUnitsAndSIPProbes(t *testing.T) {
 	named := cfg.Services[2]
 	if named.DNS != "dns:10.10.12.12:53" || named.Addr != "10.10.12.12:53" || named.Interval != 200*time.Millisecond {
 		t.Fatalf("named probe = %+v", named)
+	}
+	gateway := cfg.Services[3]
+	if gateway.AGW != "agw:10.10.12.12:7722" || gateway.Addr != "10.10.12.12:7722" || gateway.Interval != 500*time.Millisecond {
+		t.Fatalf("agw probe = %+v", gateway)
 	}
 	if cfg.Services[0].SIP != "" {
 		t.Fatalf("plain unit gained a probe: %+v", cfg.Services[0])
@@ -140,6 +144,7 @@ func TestServicesRejectIncompleteProbe(t *testing.T) {
 		"services:\n  - name: scscf.service\n    sip: sip:10.12.12.10:5060;transport=tcp\n    interval: 700ms\n",
 		"services:\n  - name: named.service\n    dns: dns:10.10.12.12\n    interval: 200ms\n",
 		"services:\n  - name: named.service\n    sip: sip:10.12.12.10:5060\n    dns: dns:10.10.12.12:53\n    interval: 200ms\n",
+		"services:\n  - name: pcscf.service\n    agw: agw:10.10.12.12:7722\n    sip: sip:10.12.12.10:5060\n    interval: 200ms\n",
 	} {
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)

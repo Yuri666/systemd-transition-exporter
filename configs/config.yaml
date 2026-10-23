@@ -17,6 +17,9 @@ services:
   # - name: named.service
   #   dns: dns:10.10.12.12:53
   #   interval: 200ms
+  # - name: pcscf.service
+  #   agw: agw:10.10.12.12:7722
+  #   interval: 500ms
 
 systemd:
   reconnect_interval: 1s

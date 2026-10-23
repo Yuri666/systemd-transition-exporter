@@ -48,6 +48,7 @@ const (
 	SourceRecovery
 	SourceSIP
 	SourceDNS
+	SourceAGW
 )
 
 func (s EventSource) String() string {
@@ -62,6 +63,8 @@ func (s EventSource) String() string {
 		return "sip"
 	case SourceDNS:
 		return "dns"
+	case SourceAGW:
+		return "agw"
 	default:
 		return "unknown"
 	}

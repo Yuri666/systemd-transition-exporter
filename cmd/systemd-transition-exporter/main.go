@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Yuri666/systemd-transition-exporter/internal/agw"
 	"github.com/Yuri666/systemd-transition-exporter/internal/config"
 	"github.com/Yuri666/systemd-transition-exporter/internal/delivery"
 	"github.com/Yuri666/systemd-transition-exporter/internal/dns"
@@ -46,13 +47,16 @@ func main() {
 	units := cfg.Units()
 	var sipProbes []sip.Probe
 	var dnsProbes []dns.Probe
+	var agwProbes []agw.Probe
 	var localIPs []net.IP
 	for _, svc := range cfg.Services {
 		target := svc.SIP
 		kind := "sip"
-		if svc.DNS != "" {
-			target = svc.DNS
-			kind = "dns"
+		switch {
+		case svc.DNS != "":
+			target, kind = svc.DNS, "dns"
+		case svc.AGW != "":
+			target, kind = svc.AGW, "agw"
 		}
 		if target == "" {
 			continue
@@ -70,9 +74,12 @@ func main() {
 		case "sip":
 			sipProbes = append(sipProbes, sip.Probe{Service: svc.Name, URI: svc.SIP, Addr: svc.Addr, Interval: svc.Interval})
 			log.Printf("sip probe configured service=%s target=%s interval=%s", svc.Name, svc.SIP, svc.Interval)
-		default:
+		case "dns":
 			dnsProbes = append(dnsProbes, dns.Probe{Service: svc.Name, URI: svc.DNS, Addr: svc.Addr, Interval: svc.Interval})
 			log.Printf("dns probe configured service=%s target=%s query=CH/TXT version.bind interval=%s", svc.Name, svc.DNS, svc.Interval)
+		default:
+			agwProbes = append(agwProbes, agw.Probe{Service: svc.Name, URI: svc.AGW, Addr: svc.Addr, Interval: svc.Interval})
+			log.Printf("agw probe configured service=%s target=%s interval=%s", svc.Name, svc.AGW, svc.Interval)
 		}
 	}
 	hostnames := identity.LocalHostnames()
@@ -92,11 +99,14 @@ func main() {
 	defer stop()
 
 	eng := engine.New()
-	delayed := make([]string, 0, len(sipProbes)+len(dnsProbes))
+	delayed := make([]string, 0, len(sipProbes)+len(dnsProbes)+len(agwProbes))
 	for _, probe := range sipProbes {
 		delayed = append(delayed, probe.Service)
 	}
 	for _, probe := range dnsProbes {
+		delayed = append(delayed, probe.Service)
+	}
+	for _, probe := range agwProbes {
 		delayed = append(delayed, probe.Service)
 	}
 	eng.DelayUpUntilReady(delayed)
@@ -380,6 +390,9 @@ func main() {
 	dnsProber := dns.New(ctx, dnsProbes, func(service string, at time.Time) {
 		publishReady(service, at, model.SourceDNS)
 	})
+	agwProber := agw.New(ctx, agwProbes, func(service string, at time.Time) {
+		publishReady(service, at, model.SourceAGW)
+	})
 
 	onSnapshot := func(s model.UnitSnapshot) error {
 		for _, event := range eng.Apply(s) {
@@ -402,9 +415,11 @@ func main() {
 		if state.AwaitingSIP {
 			sipProber.Start(s.Service)
 			dnsProber.Start(s.Service)
+			agwProber.Start(s.Service)
 		} else {
 			sipProber.Stop(s.Service)
 			dnsProber.Stop(s.Service)
+			agwProber.Stop(s.Service)
 		}
 		return nil
 	}

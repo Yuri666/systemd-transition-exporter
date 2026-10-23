@@ -20,13 +20,14 @@ type Config struct {
 	RemoteWrite RemoteWriteConfig `yaml:"remote_write"`
 }
 
-// Service is one monitored systemd unit. A SIP or DNS target delays the UP
-// transition until that local interface answers; a unit without one is tracked
-// from systemd alone. A service has at most one of SIP and DNS.
+// Service is one monitored systemd unit. A SIP, DNS or AGW target delays the
+// UP transition until that local interface answers; a unit without one is
+// tracked from systemd alone. A service has at most one probe target.
 type Service struct {
 	Name     string
 	SIP      string
 	DNS      string
+	AGW      string
 	Addr     string
 	Interval time.Duration
 }
@@ -37,18 +38,25 @@ func (s *Service) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	}
 	if value.Kind != yaml.MappingNode {
-		return fmt.Errorf("service must be a unit name or a mapping with name, interval and sip or dns")
+		return fmt.Errorf("service must be a unit name or a mapping with name, interval and sip, dns or agw")
 	}
 	var raw struct {
 		Name     string     `yaml:"name"`
 		SIP      string     `yaml:"sip"`
 		DNS      string     `yaml:"dns"`
+		AGW      string     `yaml:"agw"`
 		Interval probeEvery `yaml:"interval"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
 	}
-	*s = Service{Name: strings.TrimSpace(raw.Name), SIP: strings.TrimSpace(raw.SIP), DNS: strings.TrimSpace(raw.DNS), Interval: time.Duration(raw.Interval)}
+	*s = Service{
+		Name:     strings.TrimSpace(raw.Name),
+		SIP:      strings.TrimSpace(raw.SIP),
+		DNS:      strings.TrimSpace(raw.DNS),
+		AGW:      strings.TrimSpace(raw.AGW),
+		Interval: time.Duration(raw.Interval),
+	}
 	return nil
 }
 
@@ -149,16 +157,31 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("services contains duplicate unit %q", svc.Name)
 		}
 		seen[svc.Name] = struct{}{}
-		if svc.SIP != "" && svc.DNS != "" {
-			return Config{}, fmt.Errorf("services[%d] has both sip and dns", i)
+		var targets []string
+		if svc.SIP != "" {
+			targets = append(targets, "sip")
 		}
-		target, scheme := svc.SIP, "sip"
 		if svc.DNS != "" {
+			targets = append(targets, "dns")
+		}
+		if svc.AGW != "" {
+			targets = append(targets, "agw")
+		}
+		if len(targets) > 1 {
+			return Config{}, fmt.Errorf("services[%d] has more than one probe target", i)
+		}
+		target, scheme := "", ""
+		switch {
+		case svc.SIP != "":
+			target, scheme = svc.SIP, "sip"
+		case svc.DNS != "":
 			target, scheme = svc.DNS, "dns"
+		case svc.AGW != "":
+			target, scheme = svc.AGW, "agw"
 		}
 		if target == "" {
 			if svc.Interval != 0 {
-				return Config{}, fmt.Errorf("services[%d] interval requires sip or dns", i)
+				return Config{}, fmt.Errorf("services[%d] interval requires sip, dns or agw", i)
 			}
 			continue
 		}
@@ -169,10 +192,13 @@ func Load(path string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("services[%d]: %w", i, err)
 		}
-		if scheme == "sip" {
+		switch scheme {
+		case "sip":
 			svc.SIP = uri
-		} else {
+		case "dns":
 			svc.DNS = uri
+		default:
+			svc.AGW = uri
 		}
 		svc.Addr = addr
 	}
