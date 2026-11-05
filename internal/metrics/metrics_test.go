@@ -38,6 +38,22 @@ func TestHandlerDoesNotExposeRemoteWriteServiceSeries(t *testing.T) {
 	}
 }
 
+func TestHandlerExposesWALDegradation(t *testing.T) {
+	r := New()
+	r.SetWALStatus(false, 2)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.Handler(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, "systemd_transition_exporter_wal_writable 0\n") {
+		t.Fatalf("/metrics does not report a blocked WAL:\n%s", body)
+	}
+	if !strings.Contains(body, "systemd_transition_exporter_wal_pending_events 2\n") {
+		t.Fatalf("/metrics does not report the deferred events:\n%s", body)
+	}
+}
+
 func TestHandlerExposesIdentityInfo(t *testing.T) {
 	r := New()
 	r.SetIdentity("vm-lab-cscf-1", "cscf01.es.tz.vimpelcom.ru", "0.0.0.0:9877")

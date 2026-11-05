@@ -4,15 +4,46 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 )
+
+// Linux ENOSPC is 28 and EDQUOT is 122 on the architectures this exporter runs.
+// The numeric values keep the check portable for tests on other systems.
+const (
+	noSpaceErrno   = syscall.Errno(28)
+	diskQuotaErrno = syscall.Errno(122)
+)
+
+// openWritable creates the temporary state file. Tests replace it to simulate
+// a filesystem that cannot accept another write.
+var openWritable = func(name string) (syncFile, error) {
+	return os.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+}
+
+type syncFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+type walFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Seek(int64, int) (int64, error)
+	Truncate(int64) error
+	Close() error
+}
 
 // Report describes damage found in the event log at startup. A torn trailing
 // record is expected rather than exceptional: an append interrupted between
@@ -30,12 +61,17 @@ func (r Report) Empty() bool {
 }
 
 type WAL struct {
-	mu       sync.Mutex
-	file     *os.File
-	fsync    bool
-	dir      string
-	states   map[string]model.ServiceState
-	repaired Report
+	mu         sync.Mutex
+	file       walFile
+	fsync      bool
+	dir        string
+	states     map[string]model.ServiceState
+	repaired   Report
+	pending    []model.Event
+	stateDirty bool
+	syncNeeded bool
+	blocked    bool
+	lastLog    time.Time
 }
 
 func Open(dir string, fsync bool) (*WAL, error) {
@@ -78,19 +114,135 @@ func (w *WAL) Repaired() Report {
 func (w *WAL) Append(event model.Event) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.flushLocked(); err != nil {
+		if !isNoSpace(err) {
+			return err
+		}
+		w.remember(event)
+		w.block(err)
+		return nil
+	}
+	if err := w.writeEventLocked(event); err != nil {
+		if !isNoSpace(err) {
+			return err
+		}
+		// A failed sync means the record is already in the file. Queueing it
+		// again would duplicate the line once the disk accepts writes.
+		if !w.syncNeeded {
+			w.remember(event)
+		}
+		w.block(err)
+		return nil
+	}
+	w.unblock()
+	return nil
+}
+
+// Writable reports whether the last WAL write reached the disk. Pending events
+// stay in memory until a later Append or SaveState can persist them.
+func (w *WAL) Writable() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.blocked
+}
+
+// Pending is the number of transition events accepted while the disk could not
+// store them.
+func (w *WAL) Pending() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.pending)
+}
+
+func (w *WAL) remember(event model.Event) {
+	w.pending = append(w.pending, event)
+}
+
+func (w *WAL) block(err error) {
+	w.blocked = true
+	if time.Since(w.lastLog) < time.Minute {
+		return
+	}
+	w.lastLog = time.Now()
+	log.Printf("WAL write deferred pending_events=%d: %v", len(w.pending), err)
+}
+
+func (w *WAL) unblock() {
+	if !w.blocked {
+		return
+	}
+	w.blocked = false
+	log.Printf("WAL writable again")
+}
+
+func (w *WAL) flushLocked() error {
+	if w.syncNeeded {
+		if err := w.file.Sync(); err != nil {
+			return fmt.Errorf("sync WAL: %w", err)
+		}
+		w.syncNeeded = false
+	}
+	for len(w.pending) > 0 {
+		err := w.writeEventLocked(w.pending[0])
+		if w.syncNeeded {
+			w.pending = w.pending[1:]
+		}
+		if err != nil {
+			return err
+		}
+		if !w.syncNeeded {
+			w.pending = append([]model.Event(nil), w.pending[1:]...)
+		}
+	}
+	if w.stateDirty {
+		if err := w.writeStateLocked(); err != nil {
+			return err
+		}
+		w.stateDirty = false
+	}
+	return nil
+}
+
+func (w *WAL) writeEventLocked(event model.Event) error {
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
-	if _, err = w.file.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("write WAL: %w", err)
+	if err := w.appendRecord(append(data, '\n')); err != nil {
+		return err
 	}
 	if w.fsync {
 		if err := w.file.Sync(); err != nil {
+			w.syncNeeded = true
 			return fmt.Errorf("sync WAL: %w", err)
 		}
 	}
 	return nil
+}
+
+// appendRecord writes one complete line. A short or failed write is rolled
+// back to the previous end of the file so the next attempt cannot merge into
+// a partial line.
+func (w *WAL) appendRecord(payload []byte) error {
+	offset, err := w.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek WAL: %w", err)
+	}
+	n, err := w.file.Write(payload)
+	if err != nil || n != len(payload) {
+		if n > 0 {
+			_ = w.file.Truncate(offset)
+		}
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return fmt.Errorf("write WAL: %w", err)
+	}
+	return nil
+}
+
+func isNoSpace(err error) bool {
+	return errors.Is(err, noSpaceErrno) || errors.Is(err, diskQuotaErrno)
 }
 
 func (w *WAL) Close() error {
@@ -119,27 +271,48 @@ func (w *WAL) SaveState(state model.ServiceState) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.states[state.Service] = state
+	w.stateDirty = true
+	if err := w.flushLocked(); err != nil {
+		if !isNoSpace(err) {
+			return err
+		}
+		w.block(err)
+		return nil
+	}
+	w.unblock()
+	return nil
+}
+
+func (w *WAL) writeStateLocked() error {
 	data, err := json.Marshal(w.states)
 	if err != nil {
 		return fmt.Errorf("encode WAL state: %w", err)
 	}
 	path := filepath.Join(w.dir, "state.json")
 	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+	f, err := openWritable(tmp)
 	if err != nil {
 		return fmt.Errorf("open WAL state temporary file: %w", err)
 	}
-	if _, err := f.Write(append(data, '\n')); err != nil {
+	payload := append(data, '\n')
+	n, err := f.Write(payload)
+	if err != nil || n != len(payload) {
 		_ = f.Close()
+		_ = os.Remove(tmp)
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		return fmt.Errorf("write WAL state: %w", err)
 	}
 	if w.fsync {
 		if err := f.Sync(); err != nil {
 			_ = f.Close()
+			_ = os.Remove(tmp)
 			return fmt.Errorf("sync WAL state: %w", err)
 		}
 	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("close WAL state: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {

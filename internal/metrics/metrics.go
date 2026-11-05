@@ -35,6 +35,10 @@ type Registry struct {
 	recoverySlotStartMS int64
 	recoverySlotEndMS   int64
 	uncoveredSeconds    float64
+
+	walEnabled  bool
+	walWritable bool
+	walPending  int
 }
 
 func New() *Registry {
@@ -53,6 +57,17 @@ func (r *Registry) SetIdentity(hostname, instance, listen string) {
 	r.identityHostname = hostname
 	r.identityInstance = instance
 	r.identityListen = listen
+}
+
+// SetWALStatus publishes whether the event log can currently accept writes.
+// pending is the number of transitions held in memory until the disk can
+// store them. Service state continues to be delivered either way.
+func (r *Registry) SetWALStatus(writable bool, pending int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.walEnabled = true
+	r.walWritable = writable
+	r.walPending = pending
 }
 
 func (r *Registry) SetState(service string, state model.AvailabilityState) {
@@ -157,6 +172,19 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_identity_info Host identity used to detect two exporters writing the same Remote Write series.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_identity_info gauge")
 	fmt.Fprintf(w, "systemd_transition_exporter_identity_info{hostname=%s,instance=%s,listen=%s} 1\n", promLabel(r.identityHostname), promLabel(r.identityInstance), promLabel(r.identityListen))
+
+	if r.walEnabled {
+		writable := 0
+		if r.walWritable {
+			writable = 1
+		}
+		fmt.Fprintln(w, "# HELP systemd_transition_exporter_wal_writable Whether the event WAL can currently accept a write (1 writable, 0 disk full or over quota).")
+		fmt.Fprintln(w, "# TYPE systemd_transition_exporter_wal_writable gauge")
+		fmt.Fprintf(w, "systemd_transition_exporter_wal_writable %d\n", writable)
+		fmt.Fprintln(w, "# HELP systemd_transition_exporter_wal_pending_events Transition events held in memory because the WAL could not store them.")
+		fmt.Fprintln(w, "# TYPE systemd_transition_exporter_wal_pending_events gauge")
+		fmt.Fprintf(w, "systemd_transition_exporter_wal_pending_events %d\n", r.walPending)
+	}
 
 	// Service state, transition counters and transition timestamps are
 	// delivered exclusively through Remote Write. They are intentionally not

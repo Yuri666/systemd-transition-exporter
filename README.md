@@ -154,7 +154,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `1.0.2`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `1.0.3`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -418,6 +418,22 @@ systemd_transition_exporter_identity_info{hostname="cscf01",instance="cscf01.es.
 
 **`systemd_transition_exporter_identity_info`** — hostname, configured `instance` label and listen address of this process. Compare `hostname` and `instance` when two hosts appear to write one series.
 
+### WAL writability
+
+Present when `wal.enabled` is true.
+
+```text
+# HELP systemd_transition_exporter_wal_writable Whether the event WAL can currently accept a write (1 writable, 0 disk full or over quota).
+# TYPE systemd_transition_exporter_wal_writable gauge
+systemd_transition_exporter_wal_writable 1
+
+# HELP systemd_transition_exporter_wal_pending_events Transition events held in memory because the WAL could not store them.
+# TYPE systemd_transition_exporter_wal_pending_events gauge
+systemd_transition_exporter_wal_pending_events 0
+```
+
+**`systemd_transition_exporter_wal_writable`** — `1` while `events.jsonl` and `state.json` can be written, `0` when the filesystem is full or the quota is exhausted. A full disk does not stop monitoring or Remote Write. `0` means a crash before space returns can lose the transitions counted by `systemd_transition_exporter_wal_pending_events`.
+
 ### D-Bus metrics
 
 ```text
@@ -510,6 +526,8 @@ The complete metric set is therefore:
 | `systemd_service_transitions_total` | **No** | No | Internal transition counter used by the exporter implementation/history |
 | `systemd_service_last_transition_timestamp_seconds` | **No** | No | Internal last-transition timestamp |
 | `systemd_transition_exporter_identity_info` | **Yes** | No | Hostname, configured instance and listen address |
+| `systemd_transition_exporter_wal_writable` | **Yes** | No | Whether the event WAL can accept a write |
+| `systemd_transition_exporter_wal_pending_events` | **Yes** | No | Transitions kept in memory while the WAL cannot be written |
 | `systemd_transition_exporter_dbus_connected` | **Yes** | No | D-Bus connectivity |
 | `systemd_transition_exporter_dbus_disconnects_total` | **Yes** | No | D-Bus disconnect counter |
 | `systemd_transition_exporter_dbus_last_change_timestamp_seconds` | **Yes** | No | Last D-Bus state-change timestamp |
@@ -719,6 +737,8 @@ Anything discarded is reported at startup, for example:
 ```text
 WAL repaired at startup: skipped_records=0 truncated_bytes=37 state_reset=false
 ```
+
+A full disk after startup is handled the same way: the process keeps monitoring. `Append` and `SaveState` keep the new transitions in memory, `/metrics` reports `systemd_transition_exporter_wal_writable 0`, and the next snapshot tries the write again. Remote Write of the live state continues. The deferred events reach the WAL once a write succeeds. They are lost only if the process stops while the disk is still full. Other write errors, such as a permission failure, still stop the monitor.
 
 Remote Write is deliberately **at-least-once per target**. A target checkpoint
 advances only after that receiver returns `2xx` and the checkpoint file has

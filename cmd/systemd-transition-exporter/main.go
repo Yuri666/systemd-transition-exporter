@@ -120,6 +120,7 @@ func main() {
 			log.Fatal(err)
 		}
 		defer eventLog.Close()
+		reg.SetWALStatus(eventLog.Writable(), eventLog.Pending())
 		if report := eventLog.Repaired(); !report.Empty() {
 			log.Printf("WAL repaired at startup: skipped_records=%d truncated_bytes=%d state_reset=%t", report.SkippedRecords, report.TruncatedBytes, report.StateReset)
 		}
@@ -129,13 +130,30 @@ func main() {
 		}
 	}
 
-	persist := func(event model.Event) error {
-		if eventLog != nil {
-			if err := eventLog.Append(event); err != nil {
-				return err
-			}
+	publishWAL := func() {
+		if eventLog == nil {
+			return
 		}
-		return nil
+		reg.SetWALStatus(eventLog.Writable(), eventLog.Pending())
+	}
+	appendEvent := func(event model.Event) error {
+		if eventLog == nil {
+			return nil
+		}
+		err := eventLog.Append(event)
+		publishWAL()
+		return err
+	}
+	saveState := func(state model.ServiceState) error {
+		if eventLog == nil {
+			return nil
+		}
+		err := eventLog.SaveState(state)
+		publishWAL()
+		return err
+	}
+	persist := func(event model.Event) error {
+		return appendEvent(event)
 	}
 
 	walPath := filepath.Join(cfg.WAL.Directory, "events.jsonl")
@@ -200,7 +218,7 @@ func main() {
 		if eventLog != nil {
 			for _, service := range units {
 				if state, ok := eng.State(service); ok {
-					if e := eventLog.SaveState(state); e != nil {
+					if e := saveState(state); e != nil {
 						_ = httpListener.Close()
 						log.Fatalf("persist post-reboot state: %v", e)
 					}
@@ -246,12 +264,10 @@ func main() {
 					reg.Event(event)
 					startupRecovered = append(startupRecovered, event)
 					imported++
-					if eventLog != nil {
-						if state, ok := eng.State(event.Service); ok {
-							if err := eventLog.SaveState(state); err != nil {
-								_ = httpListener.Close()
-								log.Fatalf("persist startup recovery state: %v", err)
-							}
+					if state, ok := eng.State(event.Service); ok {
+						if err := saveState(state); err != nil {
+							_ = httpListener.Close()
+							log.Fatalf("persist startup recovery state: %v", err)
 						}
 					}
 					log.Printf("startup recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
@@ -348,10 +364,8 @@ func main() {
 	}
 
 	persistEvent := func(event model.Event, enqueue bool) error {
-		if eventLog != nil {
-			if err := eventLog.Append(event); err != nil {
-				return err
-			}
+		if err := appendEvent(event); err != nil {
+			return err
 		}
 		if enqueue {
 			for _, target := range targets {
@@ -375,11 +389,9 @@ func main() {
 		}
 		reg.Event(event)
 		log.Printf("transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
-		if eventLog != nil {
-			if state, ok := eng.State(service); ok {
-				if err := eventLog.SaveState(state); err != nil {
-					log.Printf("probe service=%s persist state: %v", service, err)
-				}
+		if state, ok := eng.State(service); ok {
+			if err := saveState(state); err != nil {
+				log.Printf("probe service=%s persist state: %v", service, err)
 			}
 		}
 		reg.SetState(service, model.StateUp)
@@ -406,10 +418,8 @@ func main() {
 		if existing, ok := eng.State(s.Service); ok {
 			state = existing
 		}
-		if eventLog != nil {
-			if err := eventLog.SaveState(state); err != nil {
-				return err
-			}
+		if err := saveState(state); err != nil {
+			return err
 		}
 		reg.SetState(s.Service, state.Availability)
 		if state.AwaitingSIP {
@@ -444,11 +454,9 @@ func main() {
 				reg.Event(event)
 				recovered = append(recovered, event)
 				count++
-				if eventLog != nil {
-					if state, ok := eng.State(event.Service); ok {
-						if err := eventLog.SaveState(state); err != nil {
-							return err
-						}
+				if state, ok := eng.State(event.Service); ok {
+					if err := saveState(state); err != nil {
+						return err
 					}
 				}
 				log.Printf("recovered transition seq=%d service=%s state=%s timestamp_ms=%d source=%s", event.Sequence, event.Service, event.State, event.EventTimeUnixMS, event.Source)
