@@ -1,6 +1,7 @@
 package remote_write
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -288,6 +289,98 @@ func TestRejectedRequestIsReportedAsPermanent(t *testing.T) {
 		t.Fatalf("error = %v, want permanent rejection", err)
 	}
 }
+
+func TestFullDiskKeepsAcceptedSamplesAndStillSendsState(t *testing.T) {
+	var posts atomic.Int32
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	s := testSender(t, "http://receiver.invalid/api/v1/write", checkpointPath)
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		posts.Add(1)
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})}
+	previous := openCheckpointFile
+	t.Cleanup(func() { openCheckpointFile = previous })
+	openCheckpointFile = func(string) (*os.File, error) { return nil, noSpaceErrno }
+
+	event := event(1, "scscf.service", model.StateUp, 1000)
+	if err := s.Send(context.Background(), []model.Event{event}); err != nil {
+		t.Fatalf("accepted batch must not fail when the checkpoint cannot be written: %v", err)
+	}
+	if got := s.LastSent(); got != 1 {
+		t.Fatalf("LastSent = %d, want 1", got)
+	}
+	if s.Stats().CheckpointWritable {
+		t.Fatal("checkpoint was reported writable while its write was refused")
+	}
+	if err := s.Send(context.Background(), []model.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("posts = %d, want the accepted transition sent once", got)
+	}
+	if err := s.SendRecoveredStates(context.Background(), []model.StateSample{{
+		Service: "scscf.service", State: model.StateUp, TimestampUnixMS: 2000,
+	}}); err != nil {
+		t.Fatalf("state sample must be delivered while the checkpoint is deferred: %v", err)
+	}
+	if got := posts.Load(); got != 2 {
+		t.Fatalf("posts = %d, want the state sample in addition to the transition", got)
+	}
+	if _, err := os.Stat(checkpointPath); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint file = %v, want it absent until the disk accepts it", err)
+	}
+
+	openCheckpointFile = previous
+	if err := s.SendRecoveredStates(context.Background(), []model.StateSample{{
+		Service: "scscf.service", State: model.StateUp, TimestampUnixMS: 3000,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Stats().CheckpointWritable {
+		t.Fatal("checkpoint stayed blocked after the file was written")
+	}
+	restarted := testSender(t, "http://receiver.invalid/api/v1/write", checkpointPath)
+	if got := restarted.LastSent(); got != 1 {
+		t.Fatalf("restarted LastSent = %d, want 1", got)
+	}
+}
+
+func TestCheckpointPermissionErrorDoesNotStopLaterSamples(t *testing.T) {
+	var posts atomic.Int32
+	s := testSender(t, "http://receiver.invalid/api/v1/write", filepath.Join(t.TempDir(), "checkpoint.json"))
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		posts.Add(1)
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})}
+	previous := openCheckpointFile
+	t.Cleanup(func() { openCheckpointFile = previous })
+	openCheckpointFile = func(string) (*os.File, error) { return nil, os.ErrPermission }
+
+	if err := s.Send(context.Background(), []model.Event{event(1, "scscf.service", model.StateUp, 1000)}); err != nil {
+		t.Fatalf("accepted batch must not fail when the checkpoint cannot be written: %v", err)
+	}
+	if err := s.Send(context.Background(), []model.Event{event(2, "icscf.service", model.StateDown, 2000)}); err != nil {
+		t.Fatalf("later transition must not wait for the checkpoint: %v", err)
+	}
+	if err := s.SendRecoveredStates(context.Background(), []model.StateSample{{
+		Service: "scscf.service", State: model.StateUp, TimestampUnixMS: 3000,
+	}}); err != nil {
+		t.Fatalf("state sample must not wait for the checkpoint: %v", err)
+	}
+	if got := posts.Load(); got != 3 {
+		t.Fatalf("posts = %d, want both transitions and the state sample", got)
+	}
+	if s.LastSent() != 2 {
+		t.Fatalf("LastSent = %d, want 2", s.LastSent())
+	}
+	if s.Stats().CheckpointWritable {
+		t.Fatal("checkpoint was reported writable after a permission error")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestRemoteWritePreservesEventTimestamp(t *testing.T) {
 	const eventTimestamp = int64(1787436204558)

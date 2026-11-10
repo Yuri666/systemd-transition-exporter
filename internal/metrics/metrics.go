@@ -10,6 +10,7 @@ import (
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
+	"github.com/Yuri666/systemd-transition-exporter/internal/version"
 )
 
 type Registry struct {
@@ -169,6 +170,10 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	defer r.mu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_build_info Build information for this exporter process.")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_build_info gauge")
+	fmt.Fprintf(w, "systemd_transition_exporter_build_info{version=%s} 1\n", promLabel(version.Version))
+
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_identity_info Host identity used to detect two exporters writing the same Remote Write series.")
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_identity_info gauge")
 	fmt.Fprintf(w, "systemd_transition_exporter_identity_info{hostname=%s,instance=%s,listen=%s} 1\n", promLabel(r.identityHostname), promLabel(r.identityInstance), promLabel(r.identityListen))
@@ -242,6 +247,16 @@ func (r *Registry) Handler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_samples_sent_total counter")
 	for _, target := range targets {
 		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_samples_sent_total{target=%q} %d\n", target, r.remoteWrite[target].SentSamples)
+	}
+
+	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_checkpoint_writable Whether the Remote Write checkpoint file can currently be updated (1 writable, 0 the last write failed).")
+	fmt.Fprintln(w, "# TYPE systemd_transition_exporter_remote_write_checkpoint_writable gauge")
+	for _, target := range targets {
+		writable := 0
+		if r.remoteWrite[target].CheckpointWritable {
+			writable = 1
+		}
+		fmt.Fprintf(w, "systemd_transition_exporter_remote_write_checkpoint_writable{target=%q} %d\n", target, writable)
 	}
 
 	fmt.Fprintln(w, "# HELP systemd_transition_exporter_remote_write_dropped_events_total Total number of transition events dropped after a permanent Remote Write rejection.")

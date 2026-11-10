@@ -8,6 +8,7 @@ import (
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
 	"github.com/Yuri666/systemd-transition-exporter/internal/remote_write"
+	"github.com/Yuri666/systemd-transition-exporter/internal/version"
 )
 
 func TestHandlerDoesNotExposeRemoteWriteServiceSeries(t *testing.T) {
@@ -51,6 +52,29 @@ func TestHandlerExposesWALDegradation(t *testing.T) {
 	}
 	if !strings.Contains(body, "systemd_transition_exporter_wal_pending_events 2\n") {
 		t.Fatalf("/metrics does not report the deferred events:\n%s", body)
+	}
+}
+
+func TestHandlerExposesCheckpointWritability(t *testing.T) {
+	r := New()
+	r.SetRemoteWriteStats("a44dc7d5cc17", remote_write.Stats{CheckpointWritable: false})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.Handler(w, req)
+	if !strings.Contains(w.Body.String(), "systemd_transition_exporter_remote_write_checkpoint_writable{target=\"a44dc7d5cc17\"} 0\n") {
+		t.Fatalf("/metrics does not report a deferred checkpoint:\n%s", w.Body.String())
+	}
+}
+
+func TestHandlerExposesBuildInfo(t *testing.T) {
+	r := New()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.Handler(w, req)
+	want := `systemd_transition_exporter_build_info{version="` + version.Version + `"} 1`
+	if !strings.Contains(w.Body.String(), want) {
+		t.Fatalf("/metrics does not contain the release version:\n%s", w.Body.String())
 	}
 }
 

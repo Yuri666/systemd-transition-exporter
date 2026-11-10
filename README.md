@@ -154,7 +154,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`). The current release is `1.0.3`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`) and exposes it on `/metrics` as `systemd_transition_exporter_build_info`. The current release is `1.0.5`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -408,6 +408,16 @@ separately for each target.
 
 The `/metrics` endpoint intentionally exposes **exporter/transport diagnostics only**. Service state, transition counters and transition timestamps are not exposed through `/metrics`; they are delivered through Remote Write to avoid creating duplicate Prometheus series from scrape and Remote Write.
 
+### Build
+
+```text
+# HELP systemd_transition_exporter_build_info Build information for this exporter process.
+# TYPE systemd_transition_exporter_build_info gauge
+systemd_transition_exporter_build_info{version="1.0.5"} 1
+```
+
+**`systemd_transition_exporter_build_info`** — release identifier of this process, the same value logged at startup. It is not sent through Remote Write.
+
 ### Identity
 
 ```text
@@ -505,6 +515,14 @@ systemd_transition_exporter_remote_write_samples_sent_total{target="8bf3a21c54d0
 **`systemd_transition_exporter_remote_write_samples_sent_total`** — total number of samples contained in successfully accepted Remote Write requests. It counts samples, not unique transitions.
 
 ```text
+# HELP systemd_transition_exporter_remote_write_checkpoint_writable Whether the Remote Write checkpoint file can currently be updated (1 writable, 0 the last write failed).
+# TYPE systemd_transition_exporter_remote_write_checkpoint_writable gauge
+systemd_transition_exporter_remote_write_checkpoint_writable{target="8bf3a21c54d0"} 1
+```
+
+**`systemd_transition_exporter_remote_write_checkpoint_writable`** — `1` while the target's checkpoint file can be updated. `0` means the receiver is still accepting data, but the delivery position is only in memory because the checkpoint file could not be written. Transitions and availability samples continue. A restart before the file is written can repeat the samples accepted while this gauge was `0`.
+
+```text
 # HELP systemd_transition_exporter_remote_write_dropped_events_total Total number of transition events dropped after a permanent Remote Write rejection.
 # TYPE systemd_transition_exporter_remote_write_dropped_events_total counter
 systemd_transition_exporter_remote_write_dropped_events_total{target="8bf3a21c54d0"} 0
@@ -525,6 +543,7 @@ The complete metric set is therefore:
 | `systemd_service_state` | **No** | **Yes** | Service availability and historical transitions |
 | `systemd_service_transitions_total` | **No** | No | Internal transition counter used by the exporter implementation/history |
 | `systemd_service_last_transition_timestamp_seconds` | **No** | No | Internal last-transition timestamp |
+| `systemd_transition_exporter_build_info` | **Yes** | No | Release identifier of this process |
 | `systemd_transition_exporter_identity_info` | **Yes** | No | Hostname, configured instance and listen address |
 | `systemd_transition_exporter_wal_writable` | **Yes** | No | Whether the event WAL can accept a write |
 | `systemd_transition_exporter_wal_pending_events` | **Yes** | No | Transitions kept in memory while the WAL cannot be written |
@@ -536,6 +555,7 @@ The complete metric set is therefore:
 | `systemd_transition_exporter_remote_write_failed_requests_total` | **Yes** | No | Failed Remote Write requests |
 | `systemd_transition_exporter_remote_write_retries_total` | **Yes** | No | Remote Write retries |
 | `systemd_transition_exporter_remote_write_samples_sent_total` | **Yes** | No | Samples accepted by Remote Write |
+| `systemd_transition_exporter_remote_write_checkpoint_writable` | **Yes** | No | Whether the delivery checkpoint file can be updated |
 | `systemd_transition_exporter_remote_write_dropped_events_total` | **Yes** | No | Transitions dropped after a permanent rejection |
 | `systemd_transition_exporter_recovery_attempts_total` | **Yes** | No | Aligned recovery slots attempted |
 | `systemd_transition_exporter_recovery_slot_start_timestamp_seconds` | **Yes** | No | Start of the last recovered slot |
@@ -738,13 +758,9 @@ Anything discarded is reported at startup, for example:
 WAL repaired at startup: skipped_records=0 truncated_bytes=37 state_reset=false
 ```
 
-A full disk after startup is handled the same way: the process keeps monitoring. `Append` and `SaveState` keep the new transitions in memory, `/metrics` reports `systemd_transition_exporter_wal_writable 0`, and the next snapshot tries the write again. Remote Write of the live state continues. The deferred events reach the WAL once a write succeeds. They are lost only if the process stops while the disk is still full. Other write errors, such as a permission failure, still stop the monitor.
+A full disk after startup is handled the same way: the process keeps monitoring. `Append` and `SaveState` keep the new transitions in memory, `/metrics` reports `systemd_transition_exporter_wal_writable 0`, and the next snapshot tries the write again. The deferred events reach the WAL once a write succeeds. They are lost only if the process stops while the disk is still full. Other write errors, such as a permission failure, still stop the monitor.
 
-Remote Write is deliberately **at-least-once per target**. A target checkpoint
-advances only after that receiver returns `2xx` and the checkpoint file has
-been durably persisted. A crash in the narrow interval after receiver
-acceptance but before checkpoint persistence can cause a sample to be sent
-again to that receiver after restart.
+Remote Write is deliberately **at-least-once per target**. The in-memory delivery position advances when the receiver returns `2xx`. The checkpoint file is only the cursor used after a restart, and it is written after that response. A failed write, including a full disk, an exhausted quota or a permission error, does not fail the send and does not pause later transitions or availability samples. The position stays in memory, `/metrics` reports `systemd_transition_exporter_remote_write_checkpoint_writable 0`, and a later send tries the file again. A crash before that file is written can cause the accepted samples to be sent again after restart.
 
 ## Debug endpoint
 

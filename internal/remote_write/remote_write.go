@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Yuri666/systemd-transition-exporter/internal/model"
@@ -38,6 +40,26 @@ type Stats struct {
 	FailedRequests     uint64
 	Retries            uint64
 	SentSamples        uint64
+	// CheckpointWritable is false while the delivery position is held in
+	// memory because the last checkpoint write failed.
+	CheckpointWritable bool
+}
+
+// Linux ENOSPC is 28 and EDQUOT is 122. Numeric values keep the check portable
+// for tests on other systems, matching the WAL.
+const (
+	noSpaceErrno   = syscall.Errno(28)
+	diskQuotaErrno = syscall.Errno(122)
+)
+
+func isNoSpace(err error) bool {
+	return errors.Is(err, noSpaceErrno) || errors.Is(err, diskQuotaErrno)
+}
+
+// openCheckpointFile creates the temporary checkpoint. Tests replace it to
+// simulate a filesystem that cannot accept another write.
+var openCheckpointFile = func(name string) (*os.File, error) {
+	return os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
 }
 
 // maxAttempts bounds a single delivery attempt so the sender cannot block the
@@ -66,12 +88,15 @@ func IsPermanent(err error) bool {
 }
 
 type Sender struct {
-	cfg      Config
-	client   *http.Client
-	mu       sync.Mutex
-	sendMu   sync.Mutex
-	lastSent uint64
+	cfg             Config
+	client          *http.Client
+	mu              sync.Mutex
+	sendMu          sync.Mutex
+	lastSent        uint64
+	checkpointSaved uint64
+	checkpointLog   time.Time
 
+	checkpointWritable atomic.Bool
 	successfulRequests atomic.Uint64
 	failedRequests     atomic.Uint64
 	retries            atomic.Uint64
@@ -99,7 +124,14 @@ func MigrateCheckpoint(source, destination string) error {
 		return fmt.Errorf("read checkpoint migration marker: %w", err)
 	}
 	if _, err := os.Stat(destination); err == nil {
-		return os.WriteFile(marker, []byte(destination+"\n"), 0640)
+		if err := os.WriteFile(marker, []byte(destination+"\n"), 0640); err != nil {
+			if isNoSpace(err) {
+				log.Printf("remote_write checkpoint migration marker deferred path=%s: %v", marker, err)
+				return nil
+			}
+			return fmt.Errorf("write checkpoint migration marker: %w", err)
+		}
+		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat destination checkpoint: %w", err)
 	}
@@ -115,6 +147,10 @@ func MigrateCheckpoint(source, destination string) error {
 		return fmt.Errorf("decode legacy remote_write checkpoint: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0750); err != nil {
+		if isNoSpace(err) {
+			log.Printf("remote_write checkpoint migration deferred path=%s: %v", destination, err)
+			return nil
+		}
 		return fmt.Errorf("create checkpoint directory: %w", err)
 	}
 	f, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0640)
@@ -122,6 +158,10 @@ func MigrateCheckpoint(source, destination string) error {
 		return nil
 	}
 	if err != nil {
+		if isNoSpace(err) {
+			log.Printf("remote_write checkpoint migration deferred path=%s: %v", destination, err)
+			return nil
+		}
 		return fmt.Errorf("create migrated checkpoint: %w", err)
 	}
 	ok := false
@@ -132,18 +172,30 @@ func MigrateCheckpoint(source, destination string) error {
 		}
 	}()
 	if _, err := f.Write(append(data, '\n')); err != nil {
+		if isNoSpace(err) {
+			log.Printf("remote_write checkpoint migration deferred path=%s: %v", destination, err)
+			return nil
+		}
 		return fmt.Errorf("write migrated checkpoint: %w", err)
 	}
 	if err := f.Sync(); err != nil {
+		if isNoSpace(err) {
+			log.Printf("remote_write checkpoint migration deferred path=%s: %v", destination, err)
+			return nil
+		}
 		return fmt.Errorf("sync migrated checkpoint: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close migrated checkpoint: %w", err)
 	}
+	ok = true
 	if err := os.WriteFile(marker, []byte(destination+"\n"), 0640); err != nil {
+		if isNoSpace(err) {
+			log.Printf("remote_write checkpoint migration marker deferred path=%s: %v", marker, err)
+			return nil
+		}
 		return fmt.Errorf("write checkpoint migration marker: %w", err)
 	}
-	ok = true
 	return nil
 }
 
@@ -174,6 +226,7 @@ func New(cfg Config) (*Sender, error) {
 	}
 
 	s := &Sender{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}}
+	s.checkpointWritable.Store(true)
 	if err := s.loadCheckpoint(); err != nil {
 		return nil, err
 	}
@@ -192,6 +245,7 @@ func (s *Sender) Stats() Stats {
 		FailedRequests:     s.failedRequests.Load(),
 		Retries:            s.retries.Load(),
 		SentSamples:        s.sentSamples.Load(),
+		CheckpointWritable: s.checkpointWritable.Load(),
 	}
 }
 
@@ -201,6 +255,7 @@ func (s *Sender) Send(ctx context.Context, events []model.Event) error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	s.retryCheckpoint()
 	return s.sendEventsLocked(ctx, events)
 }
 
@@ -229,9 +284,11 @@ func (s *Sender) sendEventsLocked(ctx context.Context, events []model.Event) err
 		if err := s.sendBatch(ctx, batch); err != nil {
 			return err
 		}
-		if err := s.saveCheckpoint(batch[len(batch)-1].Sequence); err != nil {
-			return fmt.Errorf("persist remote_write checkpoint after successful batch: %w", err)
-		}
+		// The receiver already accepted this batch. The checkpoint is only the
+		// restart cursor, so a failed write must not repeat the batch or hold
+		// back later samples.
+		s.rememberDelivered(batch[len(batch)-1].Sequence)
+		s.retryCheckpoint()
 		start = end
 	}
 	return nil
@@ -249,6 +306,9 @@ func (s *Sender) SendRecoveredStates(ctx context.Context, samples []model.StateS
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	// The checkpoint is a restart cursor. Its write must not decide whether
+	// the availability samples are delivered.
+	s.retryCheckpoint()
 
 	series := make(map[string]*prompb.TimeSeries)
 	for _, sample := range samples {
@@ -376,19 +436,68 @@ func (s *Sender) loadCheckpoint() error {
 		return fmt.Errorf("decode remote_write checkpoint: %w", err)
 	}
 	s.lastSent = c.LastSequence
+	s.checkpointSaved = c.LastSequence
 	return nil
 }
 
-// saveCheckpoint makes the delivery checkpoint durable before returning. The
-// sequence is advanced only after the corresponding Remote Write request has
-// returned a successful 2xx response. The temporary file is synced before the
-// atomic rename and the containing directory is synced afterwards.
-func (s *Sender) saveCheckpoint(seq uint64) error {
+// rememberDelivered records that the receiver accepted seq. It does not by
+// itself make that position durable.
+func (s *Sender) rememberDelivered(seq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if seq <= s.lastSent {
-		return nil
+	if seq > s.lastSent {
+		s.lastSent = seq
 	}
+}
+
+// retryCheckpoint writes the in-memory delivery position when it is ahead of
+// the checkpoint file. The samples are already accepted, so any write error
+// leaves the position in memory and is retried on a later send. Failing the
+// send here would only pause availability that the receiver has already taken
+// or is ready to take.
+func (s *Sender) retryCheckpoint() {
+	s.mu.Lock()
+	seq := s.lastSent
+	saved := s.checkpointSaved
+	s.mu.Unlock()
+	if seq <= saved {
+		return
+	}
+	if err := s.writeCheckpoint(seq); err != nil {
+		s.noteCheckpointDeferred(err)
+		return
+	}
+	s.markCheckpointSaved(seq)
+}
+
+func (s *Sender) noteCheckpointDeferred(err error) {
+	s.checkpointWritable.Store(false)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Since(s.checkpointLog) < time.Minute {
+		return
+	}
+	s.checkpointLog = time.Now()
+	log.Printf("remote_write checkpoint deferred path=%s: %v", s.cfg.Checkpoint, err)
+}
+
+func (s *Sender) markCheckpointSaved(seq uint64) {
+	wasBlocked := !s.checkpointWritable.Load()
+	s.mu.Lock()
+	if seq > s.checkpointSaved {
+		s.checkpointSaved = seq
+	}
+	s.mu.Unlock()
+	s.checkpointWritable.Store(true)
+	if wasBlocked {
+		log.Printf("remote_write checkpoint writable again path=%s", s.cfg.Checkpoint)
+	}
+}
+
+// writeCheckpoint makes seq durable. The temporary file is synced before the
+// atomic rename and the containing directory is synced afterwards. The caller
+// decides when the in-memory delivery position moves.
+func (s *Sender) writeCheckpoint(seq uint64) error {
 	data, err := json.Marshal(checkpoint{LastSequence: seq})
 	if err != nil {
 		return err
@@ -397,7 +506,7 @@ func (s *Sender) saveCheckpoint(seq uint64) error {
 		return err
 	}
 	tmp := s.cfg.Checkpoint + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
+	f, err := openCheckpointFile(tmp)
 	if err != nil {
 		return fmt.Errorf("open checkpoint temporary file: %w", err)
 	}
@@ -434,7 +543,6 @@ func (s *Sender) saveCheckpoint(seq uint64) error {
 		return fmt.Errorf("close checkpoint directory: %w", err)
 	}
 
-	s.lastSent = seq
 	ok = true
 	return nil
 }
