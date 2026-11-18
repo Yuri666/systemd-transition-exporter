@@ -49,6 +49,17 @@ func main() {
 	var dnsProbes []dns.Probe
 	var agwProbes []agw.Probe
 	var localIPs []net.IP
+	var startupStates map[string]model.AvailabilityState
+	for _, svc := range cfg.Services {
+		if svc.SIP != "" || svc.DNS != "" || svc.AGW != "" {
+			var e error
+			startupStates, e = systemd.CurrentStates(context.Background(), units)
+			if e != nil {
+				log.Printf("read current unit states: %v", e)
+			}
+			break
+		}
+	}
 	for _, svc := range cfg.Services {
 		target := svc.SIP
 		kind := "sip"
@@ -68,7 +79,13 @@ func main() {
 			}
 		}
 		if err := sip.RequireLocal(svc.Addr, localIPs); err != nil {
-			log.Fatalf("%s probe service=%s target=%s: %v", kind, svc.Name, target, err)
+			// The address often appears only when the unit becomes active.
+			// A missing address must not stop the exporter. It is reported
+			// when the unit is already active, or when its state is unknown.
+			state, known := startupStates[svc.Name]
+			if !known || state == model.StateUp {
+				log.Printf("%s probe service=%s target=%s: %v; starting anyway", kind, svc.Name, target, err)
+			}
 		}
 		switch kind {
 		case "sip":
@@ -239,9 +256,11 @@ func main() {
 	}
 	// The monitor is not running yet, so the slot baseline for a first start
 	// with an empty WAL can only come from systemd itself.
-	startupStates, err := systemd.CurrentStates(ctx, units)
-	if err != nil {
-		log.Printf("read current unit states for the recovery baseline: %v", err)
+	if startupStates == nil {
+		startupStates, err = systemd.CurrentStates(ctx, units)
+		if err != nil {
+			log.Printf("read current unit states for the recovery baseline: %v", err)
+		}
 	}
 
 	var startupFill []model.StateSample

@@ -32,7 +32,7 @@ any other ActiveState           -> DOWN
 
 In particular, `inactive`, `activating`, `deactivating`, `failed`, `reloading`, `maintenance`, and `unknown` are DOWN.
 
-A service can additionally name a local SIP, DNS or AGW interface. After a transition to `active` that this process observes, that service stays DOWN until the probe answers. The time of that answer is the UP transition, and probing then stops. SIP sends OPTIONS and waits for `200`. DNS, used for `named` on the same host, sends one UDP query, `CH TXT version.bind`: named answers that itself, so the check does not wait on recursion or on a zone name. Any DNS response counts, including `REFUSED` from a server that hides the chaos class. AGW, used for `pcscf` on the same host, sends the UDP ping pcscf itself uses toward the gateway: a token, a space, and the bencode dictionary `d7:command4:pinge`. The gateway is up when it echoes that token in `d6:result4:ponge`. A unit that is already active when the exporter starts is UP immediately and is not probed. The exporter refuses to start when the probe address is not assigned to a local interface. Journal recovery keeps the systemd `Started` time: the journal has no record of the probe answer.
+A service can additionally name a local SIP, DNS or AGW interface. After a transition to `active` that this process observes, that service stays DOWN until the probe answers. The time of that answer is the UP transition, and probing then stops. SIP sends OPTIONS and waits for `200`. DNS, used for `named` on the same host, sends one UDP query, `CH TXT version.bind`: named answers that itself, so the check does not wait on recursion or on a zone name. Any DNS response counts, including `REFUSED` from a server that hides the chaos class. AGW, used for `pcscf` on the same host, sends the UDP ping pcscf itself uses toward the gateway: a token, a space, and the bencode dictionary `d7:command4:pinge`. The gateway is up when it echoes that token in `d6:result4:ponge`. A unit that is already active when the exporter starts is UP immediately and is not probed. A missing probe address does not stop the exporter. When the unit is already active, or its state cannot be read, the missing address is logged and the process still starts. An inactive unit is not reported for a missing address, because that address may appear when the unit starts. Journal recovery keeps the systemd `Started` time: the journal has no record of the probe answer.
 
 ## Current implementation status
 
@@ -154,7 +154,7 @@ go build -o bin/systemd-transition-exporter ./cmd/systemd-transition-exporter
 
 The Makefile provides `make test`, `make build`, `make check`, and `make clean`.
 
-The binary logs its release at startup (`systemd-transition-exporter version …`) and exposes it on `/metrics` as `systemd_transition_exporter_build_info`. The current release is `1.0.5`, from `internal/version/version.go`.
+The binary logs its release at startup (`systemd-transition-exporter version …`) and exposes it on `/metrics` as `systemd_transition_exporter_build_info`. The current release is `1.0.6`, from `internal/version/version.go`.
 
 ## Configuration
 
@@ -212,7 +212,7 @@ remote_write:
 The TCP port is set from the command line with `--web.listen-port`; that flag
 replaces the port in `server.listen` and leaves the host unchanged. Without the
 flag the address from the file is used, defaulting to `127.0.0.1:9877`.
-`server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. An entry is either a unit name or a mapping with `name`, one of `sip` (`sip:host:port`), `dns` (`dns:host:port`) or `agw` (`agw:host:port`), and `interval` (`700ms`, or a bare number of milliseconds). The host must be an address of this machine. The interval is both the period and the timeout of one UDP request; the next request waits out the interval and does not overlap the previous one. SIP accepts only response code 200. DNS accepts any response to `CH TXT version.bind`. AGW accepts only a pong that echoes the ping token. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
+`server.debug` enables the destructive D-Bus disconnect test endpoint and defaults to false. `services` contains the systemd units to monitor. An entry is either a unit name or a mapping with `name`, one of `sip` (`sip:host:port`), `dns` (`dns:host:port`) or `agw` (`agw:host:port`), and `interval` (`700ms`, or a bare number of milliseconds). The host is expected to be an address of this machine. A missing address does not stop the exporter: it is logged when the unit is already active, and it is not logged while the unit is inactive. The interval is both the period and the timeout of one UDP request; the next request waits out the interval and does not overlap the previous one. SIP accepts only response code 200. DNS accepts any response to `CH TXT version.bind`. AGW accepts only a pong that echoes the ping token. `reconnect_interval` controls the delay between reconnect attempts after a real D-Bus disconnect, while `reconciliation_interval` controls periodic snapshots used to catch missed signals.
 
 `wal.enabled`, `wal.directory` and `wal.fsync` control the durable collector event log. The WAL file is `<wal.directory>/events.jsonl`.
 
@@ -413,7 +413,7 @@ The `/metrics` endpoint intentionally exposes **exporter/transport diagnostics o
 ```text
 # HELP systemd_transition_exporter_build_info Build information for this exporter process.
 # TYPE systemd_transition_exporter_build_info gauge
-systemd_transition_exporter_build_info{version="1.0.5"} 1
+systemd_transition_exporter_build_info{version="1.0.6"} 1
 ```
 
 **`systemd_transition_exporter_build_info`** — release identifier of this process, the same value logged at startup. It is not sent through Remote Write.
