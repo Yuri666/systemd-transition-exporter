@@ -11,15 +11,44 @@ import (
 
 func TestIsOKMatchesCallID(t *testing.T) {
 	ok := []byte("SIP/2.0 200 OK\r\nCall-ID: abc\r\nCSeq: 1 OPTIONS\r\n\r\n")
-	if !IsOK(ok, []byte("abc")) {
+	if !IsOK(ok, []byte("abc"), 70) {
 		t.Fatal("matching 200 was rejected")
 	}
-	if IsOK(ok, []byte("other")) {
+	if IsOK(ok, []byte("other"), 70) {
 		t.Fatal("200 for another call was accepted")
 	}
 	trying := []byte("SIP/2.0 100 Trying\r\nCall-ID: abc\r\n\r\n")
-	if IsOK(trying, []byte("abc")) {
+	if IsOK(trying, []byte("abc"), 0) {
 		t.Fatal("provisional response was accepted as ready")
+	}
+	hops := []byte("SIP/2.0 483 Too Many Hops\r\nCall-ID: abc\r\n\r\n")
+	if !IsOK(hops, []byte("abc"), 0) {
+		t.Fatal("483 for a zero-hop probe was rejected")
+	}
+	if IsOK(hops, []byte("abc"), 70) {
+		t.Fatal("483 for a 70-hop probe was accepted")
+	}
+	if IsOK(hops, []byte("other"), 0) {
+		t.Fatal("483 for another call was accepted")
+	}
+}
+
+func TestOptionsMaxForwards(t *testing.T) {
+	pcscf, err := Options("sip:10.255.98.75:5060", "10.255.98.75", 52406, 1, MaxForwards("pcscf.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(pcscf.Bytes, []byte("Max-Forwards: 0\r\n")) {
+		t.Fatalf("pcscf OPTIONS:\n%s", pcscf.Bytes)
+	}
+	for _, name := range []string{"icscf.service", "scscf.service"} {
+		message, err := Options("sip:10.12.12.10:5060", "10.12.12.10", 5060, 1, MaxForwards(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(message.Bytes, []byte("Max-Forwards: 70\r\n")) {
+			t.Fatalf("%s OPTIONS:\n%s", name, message.Bytes)
+		}
 	}
 }
 
@@ -55,6 +84,34 @@ func TestProbeStopsAtFirst200(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if requests.Load() != seen {
 		t.Fatalf("probe kept sending after the 200: %d then %d", seen, requests.Load())
+	}
+}
+
+func TestProbeStopsAt483(t *testing.T) {
+	addr, requests := serveSIP(t, func(_ int, callID string) []byte {
+		return sipResponse(483, callID)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prober := New(ctx, []Probe{{
+		Service:  "pcscf.service",
+		URI:      "sip:" + addr,
+		Addr:     addr,
+		Interval: 30 * time.Millisecond,
+	}}, nil)
+	ready := make(chan time.Time, 1)
+	prober.ready = func(_ string, at time.Time) { ready <- at }
+	prober.Start("pcscf.service")
+
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe did not finish on 483")
+	}
+	seen := requests.Load()
+	time.Sleep(100 * time.Millisecond)
+	if requests.Load() != seen {
+		t.Fatalf("probe kept sending after 483: %d then %d", seen, requests.Load())
 	}
 }
 
@@ -107,7 +164,7 @@ func serveSIP(t *testing.T, respond func(n int, callID string) []byte) (string, 
 }
 
 func sipResponse(code int, callID string) []byte {
-	status := map[int]string{100: "Trying", 200: "OK"}[code]
+	status := map[int]string{100: "Trying", 200: "OK", 483: "Too Many Hops"}[code]
 	return []byte("SIP/2.0 " + itoa(code) + " " + status + "\r\nCall-ID: " + callID + "\r\nContent-Length: 0\r\n\r\n")
 }
 

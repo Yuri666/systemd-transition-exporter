@@ -3,18 +3,20 @@ package sip
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
 )
 
-// Probe is one SIP interface whose first 200 becomes the service UP time.
+// Probe is one SIP interface whose first accepted answer becomes the service UP time.
 type Probe struct {
-	Service  string
-	URI      string
-	Addr     string
-	Interval time.Duration
+	Service     string
+	URI         string
+	Addr        string
+	Interval    time.Duration
+	MaxForwards int
 }
 
 // Prober runs at most one OPTIONS loop per service. Start during an ongoing
@@ -93,7 +95,7 @@ func (p *Prober) finish(service string, id uint64) {
 }
 
 func runProbe(ctx context.Context, probe Probe, ready func(string, time.Time)) {
-	log.Printf("sip probe service=%s target=%s started interval=%s", probe.Service, probe.URI, probe.Interval)
+	log.Printf("sip probe service=%s target=%s started interval=%s max-forwards=%d", probe.Service, probe.URI, probe.Interval, probe.MaxForwards)
 	var lastError time.Time
 	report := func(err error) {
 		if ctx.Err() != nil || time.Since(lastError) < time.Minute {
@@ -152,7 +154,7 @@ func probeOnce(ctx context.Context, probe Probe, cseq int, ready func(string, ti
 		wait(ctx, probe.Interval)
 		return false, errors.New("local sip address is not udp")
 	}
-	message, err := Options(probe.URI, local.IP.String(), local.Port, cseq)
+	message, err := Options(probe.URI, local.IP.String(), local.Port, cseq, probe.MaxForwards)
 	if err != nil {
 		wait(ctx, probe.Interval)
 		return false, err
@@ -165,6 +167,7 @@ func probeOnce(ctx context.Context, probe Probe, cseq int, ready func(string, ti
 		return false, err
 	}
 	buf := make([]byte, 65535)
+	var rejected error
 	for {
 		_ = conn.SetReadDeadline(deadline)
 		n, err := conn.Read(buf)
@@ -174,19 +177,22 @@ func probeOnce(ctx context.Context, probe Probe, cseq int, ready func(string, ti
 			}
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
-				return false, nil
+				return false, rejected
 			}
 			wait(ctx, time.Until(deadline))
 			return false, err
 		}
-		if IsOK(buf[:n], message.CallID) {
+		if IsOK(buf[:n], message.CallID, probe.MaxForwards) {
 			if ready != nil {
 				ready(probe.Service, time.Now())
 			}
 			return true, nil
 		}
+		if code, ok := statusCode(buf[:n], message.CallID); ok && code >= 200 {
+			rejected = fmt.Errorf("status %d", code)
+		}
 		if !time.Now().Before(deadline) {
-			return false, nil
+			return false, rejected
 		}
 	}
 }

@@ -89,8 +89,9 @@ func main() {
 		}
 		switch kind {
 		case "sip":
-			sipProbes = append(sipProbes, sip.Probe{Service: svc.Name, URI: svc.SIP, Addr: svc.Addr, Interval: svc.Interval})
-			log.Printf("sip probe configured service=%s target=%s interval=%s", svc.Name, svc.SIP, svc.Interval)
+			hops := sip.MaxForwards(svc.Name)
+			sipProbes = append(sipProbes, sip.Probe{Service: svc.Name, URI: svc.SIP, Addr: svc.Addr, Interval: svc.Interval, MaxForwards: hops})
+			log.Printf("sip probe configured service=%s target=%s interval=%s max-forwards=%d", svc.Name, svc.SIP, svc.Interval, hops)
 		case "dns":
 			dnsProbes = append(dnsProbes, dns.Probe{Service: svc.Name, URI: svc.DNS, Addr: svc.Addr, Interval: svc.Interval})
 			log.Printf("dns probe configured service=%s target=%s query=CH/TXT version.bind interval=%s", svc.Name, svc.DNS, svc.Interval)
